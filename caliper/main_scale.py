@@ -583,7 +583,7 @@ def _draw_main_ticks(region: dict,
         support = _seam_anchored_support(binary, band_y1, band_y2)
     response = curves.get('normalized_response')
     if response is None:
-        response = _standardize_tick_response(w, main_ticks, support)
+        response = np.zeros(w, dtype=float)
     candidates = [int(t.get('x_projection', t.get('x', 0))) for t in main_ticks]
     raw_panel = _draw_projection_panel(
         vproj, w, 'Raw vertical projection', (110, 100, 70)
@@ -593,9 +593,16 @@ def _draw_main_ticks(region: dict,
     )
     classification = (standardization or {}).get('classification', {})
     mode = classification.get('mode', 'unknown')
+    centers = classification.get('centers') or []
+    counts = classification.get('counts') or []
+    details = f'mode={mode}'
+    if centers and counts:
+        center_text = '/'.join(f'{float(value):.1f}' for value in centers)
+        count_text = '/'.join(str(int(value)) for value in counts)
+        details += f'; centers={center_text}px; n={count_text}'
     response_title = (
         'Standardized tick response '
-        f'(mode={mode}; short=1.0, long=1.5)'
+        f'({details}; short=1.0, long=1.5)'
     )
     response_panel = _draw_projection_panel(
         response, w, response_title, (255, 190, 60)
