@@ -1,1 +1,2 @@
-Task 1: complete (contract implementation and focused tests pending review)
+Task 1: complete (commits 79edc20, review clean)
+Task 2: complete (main-scale integration and focused regression tests pending review)

@@ -1,22 +1,23 @@
-"""
-步骤 3 — 主尺识别（刻度线检测 + 数字定位识别）
+"""Step 3: main-scale tick detection and OCR geometry.
 
-流程:
-  1. 垂直投影 → 刻度线位置检测
-  2. 精密提取每条刻线的起止点
-  3. OCR 识别刻度数字（2, 3, 4, 5... cm 标记）
-  4. 结合零线位置计算整数读数
+This module detects real main-scale ticks, recovers connected upper extents,
+and refines x positions.  Main-scale OCR is deliberately performed later in
+``merger.py`` because it needs the vernier zero position; this module returns
+the tick geometry and an empty ``main_digits`` list.
 """
 
 import cv2
 import numpy as np
-from typing import List, Tuple
-
-from .result import DigitInfo
+from typing import List
 from .utils import (
-    extract_ticks_from_binary, draw_projection_plot,
+    _tick_row_threshold,
+    contiguous_segments,
+    dedupe_ticks_by_relative_gap,
+    extract_ticks_from_binary,
+    refine_tick_x_subpixel,
 )
 from .config import config
+from .standardization import build_standardization_result
 
 
 def recognize_main_scale(region: dict,
@@ -33,8 +34,8 @@ def recognize_main_scale(region: dict,
         dict with keys:
             'main_ticks':   刻度线列表
             'main_gap':     主尺间距（像素）
-            'main_digits':  OCR 识别的数字列表
-            'main_reading': 整数读数（暂用间距估算）
+            'main_digits':  空列表（正式 OCR 在 merger.py 定向执行）
+            'main_reading': 0.0 占位（正式整数在 merger.py 合并阶段计算）
             'vis_ticks':    刻度线可视化
     """
     img = region['image']
@@ -77,18 +78,32 @@ def recognize_main_scale(region: dict,
     tick_band_binary = binary[band_y1:band_y2, :]
     main_ticks = extract_ticks_from_binary(
         tick_band_binary, coarse_main_xs,
-        long_tick_factor=config.main_scale.long_tick_factor)
+        long_tick_factor=config.main_scale.long_tick_factor,
+        recover_short_ticks=config.main_scale.short_tick_recovery_enabled,
+        short_tick_min_contiguous_ratio=(
+            config.main_scale.short_tick_min_contiguous_ratio),
+        short_tick_min_foreground_factor=(
+            config.main_scale.short_tick_min_foreground_factor),
+        short_tick_period_tolerance=config.main_scale.short_tick_period_tolerance)
     if len(main_ticks) < config.main_scale.min_tick_count:
         return _empty_main_result()
-    main_ticks = _refine_main_ticks_near_split(
-        tick_band_binary, main_ticks,
-        expected_gap=_estimate_gap_from_xs(coarse_main_xs)
-    )
+    ref_y2 = max(1, band_y2 - 2)
+    ref_y1 = max(band_y1, ref_y2 - 10)
     for tick in main_ticks:
+        projection_x = min(coarse_main_xs, key=lambda x: abs(int(x) - int(tick['x'])))
+        tick['x_projection'] = int(projection_x)
+        tick['x_precise'] = refine_tick_x_subpixel(
+            img, tick['x_projection'], ref_y1, ref_y2
+        )
+        tick['x'] = int(round(tick['x_precise']))
         tick['y_start'] += band_y1
         tick['y_end'] += band_y1
         tick['y_mid'] += band_y1
 
+    # Keep the split-adjacent band for x-position detection, then recover the
+    # connected upper extent from the full main region for length/OCR geometry.
+    main_ticks = _recover_main_tick_extents_from_full_binary(binary, main_ticks)
+    main_ticks = dedupe_ticks_by_relative_gap(main_ticks, gap_ratio=0.45)
     main_ticks.sort(key=lambda t: t['x'])
     main_xs = np.array([t['x'] for t in main_ticks], dtype=int)
     main_gap = float(np.median(np.diff([t['x'] for t in main_ticks])))
@@ -102,9 +117,15 @@ def recognize_main_scale(region: dict,
     main_reading = 0.0
 
     # ── 可视化 ──
+    standardization = None
+    if make_debug:
+        support = _seam_anchored_support(binary, band_y1, band_y2)
+        standardization = _build_main_standardization(
+            w, vproj_norm, support, main_ticks
+        )
     vis_ticks = _draw_main_ticks(
         region, binary, main_ticks, vproj_norm,
-        coarse_main_xs, main_xs
+        coarse_main_xs, main_xs, standardization=standardization
     ) if make_debug else None
 
     return {
@@ -113,27 +134,32 @@ def recognize_main_scale(region: dict,
         'main_digits': [],  # v6.5: 留空，由 merger 定向填充
         'main_reading': main_reading,
         'vis_ticks': vis_ticks,
+        'standardization': standardization,
     }
 
 
 # ═══════════════════════════ 内部函数 ═══════════════════════════
 
 def find_nearest_cm_digit_region(main_ticks: List[dict],
-                                     main_gap: float,
-                                     zero_x: float,
-                                     binary: np.ndarray) -> tuple:
+                                      main_gap: float,
+                                      zero_x: float,
+                                      binary: np.ndarray,
+                                      vertical_expand_gaps: float = 0.0,
+                                      prefer_long_ticks: bool = False) -> tuple:
     if not main_ticks or main_gap <= 0 or zero_x <= 0 or binary is None:
         return None, 0, 0
 
     H, W = binary.shape[:2]
 
-    y_starts = [t['y_start'] for t in main_ticks if 'y_start' in t]
-    if len(y_starts) < 3:
+    y_top_tick = _select_ocr_anchor_tick_top(
+        main_ticks, prefer_long_ticks=prefer_long_ticks
+    )
+    if y_top_tick is None:
         return None, 0, 0
-    y_top_tick = int(round(float(np.percentile(y_starts, 85))))
 
-    y_top = max(0, y_top_tick - int(4 * main_gap))
-    y_bottom = max(y_top + 8, y_top_tick - int(1 * main_gap))
+    expand_y = max(0, int(round(main_gap * vertical_expand_gaps)))
+    y_top = max(0, y_top_tick - int(4 * main_gap) - expand_y)
+    y_bottom = max(y_top + 8, y_top_tick - int(1 * main_gap) + expand_y)
     y_bottom = min(H, y_bottom)
 
     cm_px = int(main_gap * 10)
@@ -144,6 +170,65 @@ def find_nearest_cm_digit_region(main_ticks: List[dict],
 
     binary_crop = binary[y_top:y_bottom, x_left:x_right].copy()
     return binary_crop, x_left, y_top
+
+
+def _recover_main_tick_extents_from_full_binary(binary: np.ndarray,
+                                                 ticks: List[dict]) -> List[dict]:
+    """Recover connected tick height outside the narrow split-adjacent band."""
+    if binary is None or binary.ndim != 2 or not ticks:
+        return ticks
+    h, w = binary.shape[:2]
+    recovered = []
+    for tick in ticks:
+        out = dict(tick)
+        x = int(round(float(out.get('x', 0))))
+        y_start = int(out.get('y_start', 0))
+        y_end = int(out.get('y_end', y_start))
+        if not (0 <= x < w and 0 <= y_start <= y_end < h):
+            recovered.append(out)
+            continue
+
+        strip = binary[:, max(0, x - 3):min(w, x + 4)]
+        col = np.sum(strip, axis=1)
+        foreground_rows = np.flatnonzero(col > _tick_row_threshold(col))
+        segments = contiguous_segments(foreground_rows, min_len=5)
+        connected = [
+            segment for segment in segments
+            if segment[1] >= y_start and segment[0] <= y_end
+        ]
+        if connected:
+            top, bottom = max(connected, key=lambda segment: segment[1] - segment[0])
+            if bottom - top > y_end - y_start:
+                out['y_start'] = int(top)
+                out['y_end'] = int(bottom)
+                out['y_mid'] = int((top + bottom) / 2)
+                out['length'] = int(bottom - top)
+        recovered.append(out)
+
+    lengths = [float(tick.get('length', 0)) for tick in recovered]
+    if lengths:
+        median_length = float(np.median(lengths))
+        for tick in recovered:
+            tick['is_long'] = bool(
+                tick.get('length', 0) > median_length * config.main_scale.long_tick_factor
+            )
+    return recovered
+
+
+def _select_ocr_anchor_tick_top(main_ticks: List[dict],
+                                prefer_long_ticks: bool = False) -> int:
+    y_starts = [tick['y_start'] for tick in main_ticks if 'y_start' in tick]
+    if len(y_starts) < 3:
+        return None
+    long_starts = [
+        tick['y_start'] for tick in main_ticks
+        if tick.get('is_long') and 'y_start' in tick
+    ]
+    if prefer_long_ticks and len(long_starts) >= 3:
+        # A lower quartile follows the upper edge of major ticks while
+        # resisting isolated short/partially recovered marks.
+        return int(round(float(np.percentile(long_starts, 25))))
+    return int(round(float(np.percentile(y_starts, 85))))
 
 
 def _find_threshold_segments(signal: np.ndarray,
@@ -167,92 +252,6 @@ def _find_threshold_segments(signal: np.ndarray,
     return np.array(xs, dtype=int)
 
 
-def _estimate_gap_from_xs(xs: np.ndarray) -> float:
-    if xs is None or len(xs) < 2:
-        return 0.0
-    diffs = np.diff(np.sort(np.asarray(xs, dtype=float)))
-    diffs = diffs[diffs > 1.0]
-    return float(np.median(diffs)) if len(diffs) else 0.0
-
-
-def _refine_main_ticks_near_split(binary: np.ndarray,
-                                  ticks: List[dict],
-                                  expected_gap: float) -> List[dict]:
-    if binary is None or binary.size == 0 or not ticks:
-        return ticks
-    h, w = binary.shape[:2]
-    if h <= 0 or w <= 0:
-        return ticks
-
-    radius = max(3, min(6, int(round(expected_gap * 0.20)) if expected_gap > 0 else 5))
-    ref_rows = max(8, min(14, int(round(expected_gap * 0.45)) if expected_gap > 0 else 10))
-    ref_y2 = max(1, h - 2) if h > 2 else h
-    ref_y1 = max(0, ref_y2 - ref_rows)
-    ref_band = binary[ref_y1:ref_y2, :] > 0
-    refined_ticks = []
-    for tick in ticks:
-        approx_x = int(round(tick.get('x', 0)))
-        if approx_x < 0 or approx_x >= w:
-            refined_ticks.append(tick)
-            continue
-        x1 = max(0, approx_x - radius)
-        x2 = min(w - 1, approx_x + radius)
-        if x2 <= x1:
-            refined_ticks.append(tick)
-            continue
-
-        col_scores = np.sum(ref_band[:, x1:x2 + 1], axis=0).astype(float)
-        centers = None
-        local_approx = approx_x - x1
-        if col_scores.size and float(np.max(col_scores)) > 0:
-            threshold = max(1.0, float(np.max(col_scores)) * 0.35)
-            xs = np.where(col_scores >= threshold)[0]
-            if len(xs) > 0:
-                segs = _contiguous_int_segments(xs)
-                if segs:
-                    seg = min(
-                        segs,
-                        key=lambda s: (
-                            abs(((s[0] + s[1]) / 2.0) - local_approx),
-                            -(s[1] - s[0] + 1),
-                        )
-                    )
-                    local = col_scores[seg[0]:seg[1] + 1]
-                    local_xs = np.arange(seg[0], seg[1] + 1, dtype=float)
-                    total = float(np.sum(local))
-                    if total > 1e-6:
-                        centers = x1 + float(np.sum(local_xs * local) / total)
-                    else:
-                        centers = x1 + (seg[0] + seg[1]) / 2.0
-
-        refined = dict(tick)
-        refined['x_projection'] = approx_x
-        if centers is not None and abs(float(centers) - approx_x) <= radius * 0.90:
-            refined['x'] = int(round(float(centers)))
-        refined['source'] = 'main_split_near_refined'
-        refined_ticks.append(refined)
-    return sorted(refined_ticks, key=lambda t: t['x'])
-
-
-def _contiguous_int_segments(xs: np.ndarray) -> List[tuple]:
-    if xs is None or len(xs) == 0:
-        return []
-    xs = np.array(xs, dtype=int)
-    segments = []
-    start = int(xs[0])
-    prev = int(xs[0])
-    for value in xs[1:]:
-        value = int(value)
-        if value == prev + 1:
-            prev = value
-            continue
-        segments.append((start, prev))
-        start = value
-        prev = value
-    segments.append((start, prev))
-    return segments
-
-
 def _foreground_binary_from_region(binary: np.ndarray, gray: np.ndarray) -> np.ndarray:
     if binary is None or binary.size == 0:
         return None
@@ -269,29 +268,199 @@ def _foreground_binary_from_region(binary: np.ndarray, gray: np.ndarray) -> np.n
     return out
 
 
-def _main_split_near_projection(binary: np.ndarray,
-                                band_y1: int,
-                                band_y2: int) -> np.ndarray:
-    h, w = binary.shape[:2]
-    if h <= 0 or w <= 0:
-        return np.asarray([], dtype=float)
-    band_y1 = max(0, min(h - 1, int(band_y1)))
-    band_y2 = max(band_y1 + 1, min(h, int(band_y2)))
-    band_h = band_y2 - band_y1
-    ref_rows = max(8, min(14, int(round(band_h * 0.12))))
-    ref_y2 = max(band_y1 + 1, band_y2 - 2) if band_h > 2 else band_y2
-    ref_y1 = max(band_y1, ref_y2 - ref_rows)
-    proj = np.sum(binary[ref_y1:ref_y2, :] > 0, axis=0).astype(float)
-    if np.max(proj) > 0:
-        return proj / np.max(proj)
-    return proj
+def _seam_anchored_support(binary: np.ndarray,
+                           band_y1: int,
+                           band_y2: int) -> np.ndarray:
+    band = binary[band_y1:band_y2, :] > 0
+    h, w = band.shape[:2]
+    support = np.zeros(w, dtype=float)
+    near_edge = max(8, min(18, h // 4))
+    for x in range(w):
+        rows = np.mean(band[:, max(0, x - 1):min(w, x + 2)], axis=1) >= 0.20
+        runs = []
+        start = None
+        gaps = 0
+        for y, active in enumerate(rows):
+            if active:
+                if start is None:
+                    start = y
+                gaps = 0
+            elif start is not None and gaps < 1:
+                gaps += 1
+            elif start is not None:
+                runs.append((start, y - gaps))
+                start = None
+                gaps = 0
+        if start is not None:
+            runs.append((start, h - 1 - gaps))
+        valid = [end - begin + 1 for begin, end in runs if end >= h - near_edge]
+        if valid:
+            support[x] = max(valid)
+    return support
+
+
+def _standardize_tick_response(width: int,
+                               ticks: List[dict],
+                               support: np.ndarray) -> np.ndarray:
+    response = np.zeros(max(0, int(width)), dtype=float)
+    if response.size == 0 or not ticks:
+        return response
+    values = []
+    centers = []
+    for tick in ticks:
+        x = int(tick.get('x_projection', tick.get('x', 0)))
+        if not 0 <= x < support.size:
+            continue
+        values.append(float(np.max(support[max(0, x - 2):min(support.size, x + 3)])))
+        centers.append(x)
+    if not values:
+        return response
+    long_threshold = (float(np.percentile(values, 75)) +
+                      float(np.percentile(values, 85))) / 2.0
+    for x, value in zip(centers, values):
+        amplitude = 1.5 if value >= long_threshold else 1.0
+        for offset in range(-3, 4):
+            px = x + offset
+            if 0 <= px < response.size:
+                response[px] = max(
+                    response[px],
+                    amplitude * np.exp(-0.5 * (offset / 1.1) ** 2),
+                )
+    return response
+
+
+def _build_main_standardization(width: int,
+                                vproj_norm: np.ndarray,
+                                support: np.ndarray,
+                                ticks: List[dict]) -> dict:
+    """Build display-only standardization evidence from accepted main ticks."""
+    values = []
+    for tick in ticks or []:
+        x = int(round(float(tick.get('x_projection', tick.get('x', 0)))))
+        if support is None or not 0 <= x < len(support):
+            continue
+        window = support[max(0, x - 2):min(len(support), x + 3)]
+        value = float(np.max(window)) if len(window) else 0.0
+        if np.isfinite(value):
+            values.append((tick, value))
+
+    positive = np.asarray(
+        [value for _tick, value in values if value > 0.0],
+        dtype=float,
+    )
+    classification = {
+        'mode': 'unknown',
+        'centers': [],
+        'counts': [],
+        'separation': 0.0,
+        'threshold': None,
+    }
+    labels = np.zeros(len(values), dtype=int)
+    if positive.size >= 3:
+        low = float(np.percentile(positive, 25))
+        high = float(np.percentile(positive, 75))
+        median = float(np.median(positive))
+        separation = (high - low) / max(median, 1.0)
+        if high > low and separation >= 0.20:
+            threshold = (float(np.percentile(positive, 75)) +
+                         float(np.percentile(positive, 85))) / 2.0
+            labels = np.asarray(
+                [1 if value >= threshold else 0 for _tick, value in values],
+                dtype=int,
+            )
+            counts = np.bincount(labels, minlength=2)
+            if int(np.min(counts)) >= 2:
+                centers = [
+                    float(np.mean([value for (_tick, value), label
+                                   in zip(values, labels) if label == index]))
+                    for index in (0, 1)
+                ]
+                classification.update({
+                    'mode': 'two_clusters',
+                    'centers': centers,
+                    'counts': [int(counts[0]), int(counts[1])],
+                    'separation': float((centers[1] - centers[0]) /
+                                        max(centers[0], 1.0)),
+                    'threshold': float(threshold),
+                })
+        elif median > 0.0:
+            classification.update({
+                'mode': 'single',
+                'centers': [median],
+                'counts': [int(positive.size)],
+            })
+
+    response = _standardize_tick_response(width, ticks, support)
+    median_support = float(np.median(positive)) if positive.size else 0.0
+    records = []
+    value_by_tick = {id(tick): value for tick, value in values}
+    threshold = classification.get('threshold')
+    for tick in ticks or []:
+        value = float(value_by_tick.get(id(tick), 0.0))
+        x_projection = float(tick.get('x_projection', tick.get('x', 0)))
+        x = int(round(x_projection))
+        normalized_value = float(response[x]) if 0 <= x < len(response) else 0.0
+        tick_class = 'unknown'
+        if classification['mode'] == 'two_clusters' and threshold is not None:
+            tick_class = 'long' if value >= threshold else 'short'
+        quality = (value / median_support) if median_support > 0.0 else 0.0
+        records.append({
+            'x': float(tick.get('x', x_projection)),
+            'x_projection': x_projection,
+            'measured_length': float(tick.get('length', 0.0)),
+            'support_value': value,
+            'normalized_value': normalized_value,
+            'class': tick_class,
+            'quality': float(np.clip(quality, 0.0, 2.0)),
+        })
+    return build_standardization_result(
+        width, 0, vproj_norm, support, response, records, classification
+    )
+
+
+def _draw_projection_panel(signal: np.ndarray,
+                           width: int,
+                           title: str,
+                           color: tuple,
+                           candidates: List[int] = None,
+                           height: int = 180) -> np.ndarray:
+    plot = np.full((height, width, 3), (28, 28, 28), dtype=np.uint8)
+    top = 28
+    bottom = height - 18
+    value = np.asarray(signal, dtype=float)
+    if value.size:
+        max_value = float(np.max(value))
+        normalized = value / max_value if max_value > 0 else value
+    else:
+        normalized = value
+    normalized = np.clip(normalized, 0.0, 1.5)
+    if normalized.size > 1:
+        points = np.column_stack((
+            np.arange(min(width, normalized.size)),
+            bottom - (normalized[:width] / 1.5 * (bottom - top)).astype(int),
+        )).astype(np.int32)
+        cv2.polylines(plot, [points], False, color, 2, cv2.LINE_AA)
+    cv2.line(plot, (0, bottom), (width - 1, bottom), (70, 70, 75), 1)
+    if candidates:
+        for x in candidates:
+            if 0 <= x < width:
+                cv2.line(plot, (x, top), (x, bottom), (0, 220, 100), 1)
+    cv2.putText(plot, title, (10, 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+    cv2.putText(plot, '0', (3, bottom),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (140, 140, 145), 1)
+    cv2.putText(plot, '1.0', (3, bottom - int((bottom - top) / 1.5)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (140, 140, 145), 1)
+    cv2.putText(plot, '1.5', (3, top + 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (140, 140, 145), 1)
+    return plot
 
 
 def find_digit_cc_candidates(binary_crop: np.ndarray,
-                             x_offset: int, y_offset: int,
-                             zero_x: float = None,
-                             min_area: int = 700,
-                             max_area: int = 1200,
+                              x_offset: int, y_offset: int,
+                              zero_x: float = None,
+                              min_area: int = 700,
+                              max_area: int = 3000,
                              min_aspect: float = 0.6,
                              max_aspect: float = 3.5) -> list:
     """Return all plausible digit connected components in the OCR crop."""
@@ -305,6 +474,7 @@ def find_digit_cc_candidates(binary_crop: np.ndarray,
     H, W = binary_crop.shape
     dynamic_min_area = max(250, int(H * H * 0.09))
     effective_min_area = min(min_area, dynamic_min_area)
+    dynamic_max_area = max(max_area, int(H * H * 0.20))
     candidates = []
     for j in range(1, num_labels):
         x = int(stats[j, cv2.CC_STAT_LEFT])
@@ -312,7 +482,7 @@ def find_digit_cc_candidates(binary_crop: np.ndarray,
         w = int(stats[j, cv2.CC_STAT_WIDTH])
         h = int(stats[j, cv2.CC_STAT_HEIGHT])
         area = int(stats[j, cv2.CC_STAT_AREA])
-        if area < effective_min_area or area > max_area:
+        if area < effective_min_area or area > dynamic_max_area:
             continue
         if w < 3 or h < 5:
             continue
@@ -363,7 +533,8 @@ def _draw_main_ticks(region: dict,
                       main_ticks: List[dict],
                       vproj: np.ndarray,
                       coarse_peaks: np.ndarray,
-                      refined_peaks: np.ndarray) -> np.ndarray:
+                      refined_peaks: np.ndarray,
+                      standardization: dict = None) -> np.ndarray:
     """绘制主尺刻度线检测结果 — 灰度底图 + 右侧二值图小窗"""
     img = region['image']
     h, w = img.shape
@@ -381,11 +552,17 @@ def _draw_main_ticks(region: dict,
 
     # 画刻度线
     for t in main_ticks:
-        color = (0, 255, 100) if t.get('is_long', False) else (0, 180, 80)
+        if t.get('is_recovered_short', False):
+            color = (0, 140, 255)
+        else:
+            color = (0, 255, 100) if t.get('is_long', False) else (0, 180, 80)
         thickness = 3 if t.get('is_long', False) else 2
         cv2.line(vis, (t['x'], t['y_start']), (t['x'], t['y_end']), color, thickness)
         if t.get('is_long', False):
             cv2.circle(vis, (t['x'], t['y_mid']), 5, (255, 255, 0), -1)
+    if any(t.get('is_recovered_short', False) for t in main_ticks):
+        cv2.putText(vis, "orange = recovered short tick", (8, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 140, 255), 1)
 
     # ── 右侧二值图小窗（显示检测器实际看到的二值图）──
     bin_thumb_w = max(50, w // 4)
@@ -400,24 +577,40 @@ def _draw_main_ticks(region: dict,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
     # 下方追加投影图
-    ref_proj = _main_split_near_projection(binary, band_y1, band_y2)
-    proj_vis = draw_projection_plot(
-        vproj, coarse_peaks, width=w,
-        title=f"Full tick-band projection: coarse candidates ({len(coarse_peaks)} peaks)"
+    curves = (standardization or {}).get('curves', {})
+    support = curves.get('support')
+    if support is None:
+        support = _seam_anchored_support(binary, band_y1, band_y2)
+    response = curves.get('normalized_response')
+    if response is None:
+        response = _standardize_tick_response(w, main_ticks, support)
+    candidates = [int(t.get('x_projection', t.get('x', 0))) for t in main_ticks]
+    raw_panel = _draw_projection_panel(
+        vproj, w, 'Raw vertical projection', (110, 100, 70)
     )
-    ref_proj_vis = draw_projection_plot(
-        ref_proj, refined_peaks, width=w,
-        title=f"Split-near projection: refined main ticks ({len(main_ticks)} ticks)"
+    support_panel = _draw_projection_panel(
+        support, w, 'Seam-anchored vertical support', (80, 220, 255), candidates
     )
-    ph = proj_vis.shape[0] + ref_proj_vis.shape[0] + 2
-
-    gap = 2
-    out = np.zeros((h + ph + gap, w, 3), dtype=np.uint8)
+    classification = (standardization or {}).get('classification', {})
+    mode = classification.get('mode', 'unknown')
+    response_title = (
+        'Standardized tick response '
+        f'(mode={mode}; short=1.0, long=1.5)'
+    )
+    response_panel = _draw_projection_panel(
+        response, w, response_title, (255, 190, 60)
+    )
+    panel_gap = 10
+    panels_h = raw_panel.shape[0] + support_panel.shape[0] + response_panel.shape[0] + panel_gap * 2
+    out = np.zeros((h + panels_h + panel_gap, w, 3), dtype=np.uint8)
     out[:] = (30, 30, 35)
     out[:h, :w] = vis
-    out[h + gap:h + gap + proj_vis.shape[0], :w] = proj_vis
-    y0 = h + gap + proj_vis.shape[0] + 2
-    out[y0:y0 + ref_proj_vis.shape[0], :w] = ref_proj_vis
+    y0 = h + panel_gap
+    out[y0:y0 + raw_panel.shape[0], :w] = raw_panel
+    y0 += raw_panel.shape[0] + panel_gap
+    out[y0:y0 + support_panel.shape[0], :w] = support_panel
+    y0 += support_panel.shape[0] + panel_gap
+    out[y0:y0 + response_panel.shape[0], :w] = response_panel
 
     cv2.putText(out, "STEP 3: Main Scale Ticks (gray + binary overlay)", (5, out.shape[0] - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 125), 1)
@@ -433,4 +626,5 @@ def _empty_main_result() -> dict:
         'main_digits': [],
         'main_reading': 0.0,
         'vis_ticks': empty_img,
+        'standardization': None,
     }
