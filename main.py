@@ -212,6 +212,11 @@ class CaliperApp:
             bg=self.bg_color, fg=self.success_color
         )
         self.lbl_total.pack(anchor=tk.W, pady=(0, 5))
+        self.lbl_alignment_ambiguity = tk.Label(
+            result_inner, text='', font=('Microsoft YaHei', 9),
+            bg=self.bg_color, fg=self.warn_color,
+            justify=tk.LEFT, wraplength=230,
+        )
 
         # 置信度
         tk.Label(result_inner, text="置信度", font=('Microsoft YaHei', 9),
@@ -429,7 +434,6 @@ class CaliperApp:
             '1b_方向校正',
             '2_区域分离',
             '3a_主尺刻度线',
-            '3c_零线总览',
             '4b_游标刻度线',
             '4c_游标对齐',
             '3b_主尺数字OCR',
@@ -455,7 +459,6 @@ class CaliperApp:
             '1b_方向校正': '方向校正',
             '2_区域分离': '区域分离',
             '3a_主尺刻度线': '主尺刻线',
-            '3c_零线总览': '零线总览',
             '4b_游标刻度线': '游标刻线',
             '4c_游标对齐': '游标对齐',
             '3b_主尺数字OCR': '主尺OCR',
@@ -621,6 +624,17 @@ class CaliperApp:
             self.lbl_total.config(fg="#f38ba8")
 
         extra = result.extra_info
+        from caliper.reading_display import format_alignment_ambiguity
+        ambiguity_text = format_alignment_ambiguity(
+            extra.get('alignment_ambiguity') if isinstance(extra, dict) else None
+        )
+        if ambiguity_text:
+            self.lbl_alignment_ambiguity.config(text=ambiguity_text)
+            self.lbl_alignment_ambiguity.pack(
+                anchor=tk.W, pady=(0, 5), after=self.lbl_total
+            )
+        else:
+            self.lbl_alignment_ambiguity.pack_forget()
         # ── OCR 引擎状态 ──
         from caliper.ocr import get_ocr_reader_singleton
         reader = get_ocr_reader_singleton()

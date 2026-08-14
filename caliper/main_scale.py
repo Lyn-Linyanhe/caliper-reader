@@ -308,24 +308,20 @@ def _standardize_tick_response(width: int,
     values = []
     centers = []
     for tick in ticks:
-        x = int(tick.get('x_projection', tick.get('x', 0)))
-        if not 0 <= x < support.size:
+        support_x = int(round(tick.get('x_projection', tick.get('x', 0))))
+        render_x = int(round(tick.get('x_precise', tick.get('x', tick.get('x_projection', support_x)))))
+        if not 0 <= support_x < support.size:
             continue
-        values.append(float(np.max(support[max(0, x - 2):min(support.size, x + 3)])))
-        centers.append(x)
+        values.append(float(np.max(support[max(0, support_x - 2):min(support.size, support_x + 3)])))
+        centers.append(render_x)
     if not values:
         return response
     long_threshold = (float(np.percentile(values, 75)) +
                       float(np.percentile(values, 85))) / 2.0
     for x, value in zip(centers, values):
         amplitude = 1.5 if value >= long_threshold else 1.0
-        for offset in range(-3, 4):
-            px = x + offset
-            if 0 <= px < response.size:
-                response[px] = max(
-                    response[px],
-                    amplitude * np.exp(-0.5 * (offset / 1.1) ** 2),
-                )
+        if 0 <= x < response.size:
+            response[x] = max(response[x], amplitude)
     return response
 
 
@@ -354,6 +350,7 @@ def _build_main_standardization(width: int,
         'counts': [],
         'separation': 0.0,
         'threshold': None,
+        'response_kernel': 'center_stem',
     }
     labels = np.zeros(len(values), dtype=int)
     if positive.size >= 3:
@@ -398,14 +395,16 @@ def _build_main_standardization(width: int,
     for tick in ticks or []:
         value = float(value_by_tick.get(id(tick), 0.0))
         x_projection = float(tick.get('x_projection', tick.get('x', 0)))
-        x = int(round(x_projection))
+        x_local = float(tick.get('x_precise', tick.get('x', x_projection)))
+        x = int(round(x_local))
         normalized_value = float(response[x]) if 0 <= x < len(response) else 0.0
         tick_class = 'unknown'
         if classification['mode'] == 'two_clusters' and threshold is not None:
             tick_class = 'long' if value >= threshold else 'short'
         quality = (value / median_support) if median_support > 0.0 else 0.0
         records.append({
-            'x': float(tick.get('x', x_projection)),
+            'x': float(tick.get('x', x_local)),
+            'x_local': x_local,
             'x_projection': x_projection,
             'measured_length': float(tick.get('length', 0.0)),
             'support_value': value,
@@ -413,6 +412,57 @@ def _build_main_standardization(width: int,
             'class': tick_class,
             'quality': float(np.clip(quality, 0.0, 2.0)),
         })
+    display_xs = np.asarray([
+        float(record.get('x_projection', record.get('x_local', 0.0)))
+        for record in records
+        if np.isfinite(float(record.get('x_projection', record.get('x_local', 0.0))))
+    ], dtype=float)
+    display_gaps = np.diff(np.sort(display_xs))
+    display_gaps = display_gaps[np.isfinite(display_gaps) & (display_gaps > 0.0)]
+    spacing_median = float(np.median(display_gaps)) if display_gaps.size else 0.0
+    if display_gaps.size and spacing_median > 0.0:
+        spacing_consistency = float(np.clip(
+            1.0 - float(np.median(np.abs(display_gaps - spacing_median)))
+            / spacing_median,
+            0.0,
+            1.0,
+        ))
+        spacing_max_ratio = float(np.max(display_gaps) / spacing_median)
+    else:
+        spacing_consistency = 1.0 if not display_gaps.size else 0.0
+        spacing_max_ratio = 0.0
+    formal_count = int(len(ticks or []))
+    display_count = int(len(records))
+    support_count = int(sum(
+        float(record.get('support_value', 0.0) or 0.0) > 0.0
+        for record in records
+    ))
+    counts = [int(value) for value in classification.get('counts', []) if int(value) > 0]
+    cluster_balance = float(min(counts) / max(counts)) if len(counts) >= 2 else 1.0
+    if display_count == 0:
+        acceptance_status = 'unavailable'
+    elif display_count < 0.90 * max(1, formal_count):
+        acceptance_status = 'partial'
+    elif spacing_max_ratio > 1.75:
+        acceptance_status = 'irregular_spacing'
+    elif classification['mode'] == 'two_clusters' and cluster_balance < 0.10:
+        acceptance_status = 'unbalanced_clusters'
+    else:
+        acceptance_status = 'complete'
+    classification.update({
+        'formal_tick_count': formal_count,
+        'display_tick_count': display_count,
+        'display_spacing_median': spacing_median,
+        'display_min_gap': float(np.min(display_gaps)) if display_gaps.size else 0.0,
+        'display_max_gap': float(np.max(display_gaps)) if display_gaps.size else 0.0,
+        'spacing_consistency': spacing_consistency,
+        'spacing_max_ratio': spacing_max_ratio,
+        'support_count': support_count,
+        'support_coverage': float(support_count / max(1, display_count)),
+        'cluster_balance': cluster_balance,
+        'binary_evidence_available': False,
+        'acceptance_status': acceptance_status,
+    })
     return build_standardization_result(
         width, 0, vproj_norm, support, response, records, classification
     )

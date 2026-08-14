@@ -1,407 +1,22 @@
-"""
-步骤 1 — ROI 提取 + 方向矫正
+"""Step 1: ROI extraction and global orientation correction.
 
-① ROI 提取：投影法定位刻度区域 → 裁剪（+ 轮廓验证回退）
-② 方向矫正：HoughLinesP 检测刻线方向 → 旋转使刻线垂直
+ROI selection uses a low-resolution foreground projection, then refines the
+vernier body and validates a compact reading window.  The orientation path
+fits a seam line from Scharr-y edge points with RANSAC; it does not use the
+legacy contour or Hough-line configuration fields.
 """
 
 import cv2
 import numpy as np
 import time
-from pathlib import Path
 from typing import Tuple, List
 
 from .utils import rotate_image
 from .config import config
 from .vernier_rectify import _find_vernier_body_x_range
 
-_ROI_SCREW_TEMPLATE_CACHE = None
-
-
-def _read_image_unicode(path: Path, flags=cv2.IMREAD_COLOR):
-    if not path.exists():
-        return None
-    data = np.fromfile(str(path), dtype=np.uint8)
-    if data.size == 0:
-        return None
-    return cv2.imdecode(data, flags)
-
-
-def _load_roi_screw_template():
-    global _ROI_SCREW_TEMPLATE_CACHE
-    if _ROI_SCREW_TEMPLATE_CACHE is not None:
-        return _ROI_SCREW_TEMPLATE_CACHE
-    path = Path(__file__).resolve().parent.parent / 'templates' / 'roi_screw_template.png'
-    img = _read_image_unicode(path, cv2.IMREAD_GRAYSCALE)
-    if img is None or img.size == 0:
-        _ROI_SCREW_TEMPLATE_CACHE = False
-        return None
-    _ROI_SCREW_TEMPLATE_CACHE = img
-    return img
-
-
-def _locate_roi_by_screw_template(img_color: np.ndarray) -> dict:
-    template_gray = _load_roi_screw_template()
-    if template_gray is None or template_gray is False:
-        return None
-    if img_color is None or img_color.size == 0:
-        return None
-
-    timings = {}
-
-    def mark(key: str, start_time: float):
-        timings[key] = (time.perf_counter() - start_time) * 1000.0
-
-    h, w = img_color.shape[:2]
-    if h <= 0 or w <= 0:
-        return None
-
-    scale = min(1.0, 600.0 / float(w))
-    t0 = time.perf_counter()
-    if scale < 1.0:
-        small_color = cv2.resize(
-            img_color, (int(round(w * scale)), int(round(h * scale))),
-            interpolation=cv2.INTER_LINEAR)
-    else:
-        small_color = img_color
-    small_gray = cv2.cvtColor(small_color, cv2.COLOR_BGR2GRAY)
-    tw = max(8, int(round(template_gray.shape[1] * scale)))
-    th = max(8, int(round(template_gray.shape[0] * scale)))
-    small_template = cv2.resize(template_gray, (tw, th), interpolation=cv2.INTER_AREA)
-    mark('template_resize_gray', t0)
-
-    t0 = time.perf_counter()
-    search_gray, search_offset = _screw_template_search_window(small_gray)
-    candidates = _screw_template_candidates(
-        search_gray, small_template,
-        scales=(1.0,),
-        per_scale_k=12)
-    if search_offset != (0, 0):
-        ox, oy = search_offset
-        for candidate in candidates:
-            x, y = candidate['loc']
-            candidate['loc'] = (x + ox, y + oy)
-    mark('template_match', t0)
-    if not candidates:
-        return None
-
-    t0 = time.perf_counter()
-    pool = _nms_template_candidates(candidates, top_k=20, iou_thresh=0.25)
-    geometry = _find_two_screw_rows(
-        pool,
-        y_tolerance=55.0 * scale,
-        min_spacing=180.0 * scale,
-        spacing_tolerance=0.45,
-        row_gap_min=180.0 * scale,
-        row_gap_max=850.0 * scale,
-        x_align_ratio=0.45)
-    mark('template_geometry', t0)
-    if not _screw_geometry_is_valid(geometry):
-        t0 = time.perf_counter()
-        candidates = _screw_template_candidates(
-            search_gray, small_template,
-            scales=(0.8, 0.9, 1.0, 1.1, 1.2),
-            per_scale_k=20)
-        if search_offset != (0, 0):
-            ox, oy = search_offset
-            for candidate in candidates:
-                x, y = candidate['loc']
-                candidate['loc'] = (x + ox, y + oy)
-        timings['template_match_fallback'] = (time.perf_counter() - t0) * 1000.0
-
-        t0 = time.perf_counter()
-        pool = _nms_template_candidates(candidates, top_k=50, iou_thresh=0.25)
-        geometry = _find_two_screw_rows(
-            pool,
-            y_tolerance=55.0 * scale,
-            min_spacing=180.0 * scale,
-            spacing_tolerance=0.45,
-            row_gap_min=180.0 * scale,
-            row_gap_max=850.0 * scale,
-            x_align_ratio=0.45)
-        timings['template_geometry_fallback'] = (time.perf_counter() - t0) * 1000.0
-        if not _screw_geometry_is_valid(geometry):
-            return None
-
-    t0 = time.perf_counter()
-    polygon = _screw_roi_polygon(
-        geometry,
-        left_pad_ratio=1.10,
-        right_pad_ratio=0.65,
-        top_down_ratio=-0.08,
-        bottom_pad_ratio=0.22)
-    if polygon is None:
-        return None
-
-    xs = [p[0] for p in polygon]
-    ys = [p[1] for p in polygon]
-    inv_scale = 1.0 / scale if scale > 0 else 1.0
-    ox1 = max(0, int(np.floor(min(xs) * inv_scale)))
-    oy1 = max(0, int(np.floor(min(ys) * inv_scale)))
-    ox2 = min(w, int(np.ceil(max(xs) * inv_scale)))
-    oy2 = min(h, int(np.ceil(max(ys) * inv_scale)))
-    if ox2 - ox1 < config.roi.min_roi_width or oy2 - oy1 < config.roi.min_roi_height:
-        return None
-    crop = img_color[oy1:oy2, ox1:ox2].copy()
-    mark('template_map_and_crop', t0)
-    t0 = time.perf_counter()
-    roi_debug = _make_roi_location_vis(
-        small_color,
-        (min(xs), min(ys), max(xs), max(ys)),
-        crop,
-        'screw_template'
-    )
-    mark('roi_debug_vis', t0)
-
-    return {
-        'roi_color': crop,
-        'x_offset': ox1,
-        'y_offset': oy1,
-        'roi_box_original': (ox1, oy1, ox2, oy2),
-        'roi_box_lowres': (min(xs), min(ys), max(xs), max(ys)),
-        'roi_polygon_lowres': tuple(polygon),
-        'scale': scale,
-        'lowres_debug': roi_debug,
-        'roi_timings': timings,
-        'locate_failed': False,
-        'roi_source': 'screw_template',
-    }
-
-
-def _screw_template_search_window(gray: np.ndarray) -> tuple:
-    h, w = gray.shape[:2]
-    if h <= 0 or w <= 0:
-        return gray, (0, 0)
-    x1 = int(round(w * 0.25))
-    x2 = int(round(w * 0.75))
-    y1 = int(round(h * 0.25))
-    y2 = int(round(h * 0.75))
-    if x2 <= x1 or y2 <= y1:
-        return gray, (0, 0)
-    return gray[y1:y2, x1:x2], (x1, y1)
-
-
-def _screw_geometry_is_valid(geometry: dict) -> bool:
-    if geometry is None:
-        return False
-    items = geometry['top']['items'] + geometry['bottom']['items']
-    scores = [float(candidate.get('score', 0.0)) for candidate in items]
-    return len(scores) >= 6 and min(scores) >= 0.42
-
-
-def _screw_template_candidates(target_gray: np.ndarray,
-                               template_gray: np.ndarray,
-                               scales: tuple,
-                               per_scale_k: int) -> list:
-    candidates = []
-    th0, tw0 = template_gray.shape[:2]
-    for scale in scales:
-        tw = max(8, int(round(tw0 * scale)))
-        th = max(8, int(round(th0 * scale)))
-        if tw >= target_gray.shape[1] or th >= target_gray.shape[0]:
-            continue
-        resized = cv2.resize(template_gray, (tw, th), interpolation=cv2.INTER_AREA)
-        result = cv2.matchTemplate(target_gray, resized, cv2.TM_CCOEFF_NORMED)
-        work = result.copy()
-        suppress_x = max(1, tw // 2)
-        suppress_y = max(1, th // 2)
-        for _ in range(max(1, per_scale_k)):
-            _, max_val, _, max_loc = cv2.minMaxLoc(work)
-            candidates.append({
-                'score': float(max_val),
-                'loc': max_loc,
-                'size': (tw, th),
-                'scale': float(scale),
-            })
-            x, y = max_loc
-            x1 = max(0, x - suppress_x)
-            y1 = max(0, y - suppress_y)
-            x2 = min(work.shape[1], x + suppress_x + 1)
-            y2 = min(work.shape[0], y + suppress_y + 1)
-            work[y1:y2, x1:x2] = -1.0
-    return sorted(candidates, key=lambda item: item['score'], reverse=True)
-
-
-def _template_box(candidate: dict) -> tuple:
-    x, y = candidate['loc']
-    tw, th = candidate['size']
-    return int(x), int(y), int(x + tw), int(y + th)
-
-
-def _template_iou(a: tuple, b: tuple) -> float:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-    iw = max(0, ix2 - ix1)
-    ih = max(0, iy2 - iy1)
-    inter = iw * ih
-    if inter <= 0:
-        return 0.0
-    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
-    area_b = max(1, (bx2 - bx1) * (by2 - by1))
-    return inter / float(area_a + area_b - inter)
-
-
-def _nms_template_candidates(candidates: list, top_k: int, iou_thresh: float) -> list:
-    selected = []
-    for candidate in candidates:
-        box = _template_box(candidate)
-        if any(_template_iou(box, _template_box(prev)) > iou_thresh for prev in selected):
-            continue
-        selected.append(candidate)
-        if len(selected) >= top_k:
-            break
-    return selected
-
-
-def _template_center(candidate: dict) -> tuple:
-    x1, y1, x2, y2 = _template_box(candidate)
-    return (x1 + x2) * 0.5, (y1 + y2) * 0.5
-
-
-def _find_screw_row_triples(candidates: list,
-                            y_tolerance: float,
-                            min_spacing: float,
-                            spacing_tolerance: float) -> list:
-    rows = []
-    n = len(candidates)
-    for i in range(n):
-        for j in range(i + 1, n):
-            for k in range(j + 1, n):
-                triple = [candidates[i], candidates[j], candidates[k]]
-                centers = [_template_center(c) for c in triple]
-                ordered = sorted(zip(centers, triple), key=lambda item: item[0][0])
-                xs = [item[0][0] for item in ordered]
-                ys = [item[0][1] for item in ordered]
-                y_spread = max(ys) - min(ys)
-                if y_spread > y_tolerance:
-                    continue
-                dx1 = xs[1] - xs[0]
-                dx2 = xs[2] - xs[1]
-                if dx1 < min_spacing or dx2 < min_spacing:
-                    continue
-                spacing_ratio = abs(dx1 - dx2) / max(dx1, dx2, 1.0)
-                if spacing_ratio > spacing_tolerance:
-                    continue
-                score = sum(1.0 - item[1]['score'] for item in ordered)
-                score += (y_spread / max(y_tolerance, 1.0)) * 0.05
-                score += spacing_ratio * 0.10
-                rows.append({
-                    'items': [item[1] for item in ordered],
-                    'xs': xs,
-                    'ys': ys,
-                    'y': float(np.median(ys)),
-                    'spacing': (dx1 + dx2) * 0.5,
-                    'score': score,
-                    'spacing_ratio': spacing_ratio,
-                })
-    return sorted(rows, key=lambda item: item['score'])
-
-
-def _find_two_screw_rows(candidates: list,
-                         y_tolerance: float,
-                         min_spacing: float,
-                         spacing_tolerance: float,
-                         row_gap_min: float,
-                         row_gap_max: float,
-                         x_align_ratio: float):
-    rows = _find_screw_row_triples(candidates, y_tolerance, min_spacing, spacing_tolerance)
-    best = None
-    row_limit = min(len(rows), 300)
-    for a_idx in range(row_limit):
-        for b_idx in range(a_idx + 1, row_limit):
-            row_a = rows[a_idx]
-            row_b = rows[b_idx]
-            top, bottom = (row_a, row_b) if row_a['y'] <= row_b['y'] else (row_b, row_a)
-            row_gap = bottom['y'] - top['y']
-            if row_gap < row_gap_min or row_gap > row_gap_max:
-                continue
-            avg_spacing = max(1.0, (top['spacing'] + bottom['spacing']) * 0.5)
-            x_align = float(np.median([abs(tx - bx) for tx, bx in zip(top['xs'], bottom['xs'])]))
-            if x_align > avg_spacing * x_align_ratio:
-                continue
-            spacing_diff = abs(top['spacing'] - bottom['spacing']) / avg_spacing
-            if spacing_diff > spacing_tolerance:
-                continue
-            pair_score = top['score'] + bottom['score']
-            pair_score += (x_align / max(avg_spacing * x_align_ratio, 1.0)) * 0.20
-            pair_score += spacing_diff * 0.15
-            pair_score += (row_gap / max(row_gap_max, 1.0)) * 0.02
-            if best is None or pair_score < best['score']:
-                best = {
-                    'top': top,
-                    'bottom': bottom,
-                    'score': pair_score,
-                    'row_gap': row_gap,
-                    'x_align': x_align,
-                    'spacing_diff': spacing_diff,
-                }
-    return best
-
-
-def _screw_roi_polygon(geometry: dict,
-                       left_pad_ratio: float,
-                       right_pad_ratio: float,
-                       top_down_ratio: float,
-                       bottom_pad_ratio: float):
-    top_centers = [np.array(_template_center(c), dtype=np.float32) for c in geometry['top']['items']]
-    bottom_centers = [np.array(_template_center(c), dtype=np.float32) for c in geometry['bottom']['items']]
-    all_centers = top_centers + bottom_centers
-    row_vec = ((top_centers[-1] - top_centers[0]) +
-               (bottom_centers[-1] - bottom_centers[0])) * 0.5
-    row_norm = float(np.linalg.norm(row_vec))
-    if row_norm < 1e-6:
-        return None
-    x_axis = row_vec / row_norm
-    y_axis = np.array([-x_axis[1], x_axis[0]], dtype=np.float32)
-    row_down = np.mean(bottom_centers, axis=0) - np.mean(top_centers, axis=0)
-    if float(np.dot(y_axis, row_down)) < 0:
-        y_axis = -y_axis
-
-    us = [float(np.dot(p, x_axis)) for p in all_centers]
-    top_vs = [float(np.dot(p, y_axis)) for p in top_centers]
-    bottom_vs = [float(np.dot(p, y_axis)) for p in bottom_centers]
-    left_u = min(us)
-    right_u = max(us)
-    top_v = float(np.median(top_vs))
-    bottom_v = float(np.median(bottom_vs))
-    spacing = max(1.0, (geometry['top']['spacing'] + geometry['bottom']['spacing']) * 0.5)
-    row_gap = max(1.0, bottom_v - top_v)
-
-    widths = []
-    heights = []
-    for candidate in geometry['top']['items'] + geometry['bottom']['items']:
-        x1, y1, x2, y2 = _template_box(candidate)
-        widths.append(x2 - x1)
-        heights.append(y2 - y1)
-    half_w = float(np.median(widths)) * 0.5
-    half_h = float(np.median(heights)) * 0.5
-
-    u_min = left_u - spacing * left_pad_ratio - half_w
-    u_max = right_u + spacing * right_pad_ratio + half_w
-    v_min = top_v + row_gap * top_down_ratio - half_h
-    v_max = bottom_v + row_gap * bottom_pad_ratio + half_h
-
-    corners = []
-    for u, v in [(u_min, v_min), (u_max, v_min), (u_max, v_max), (u_min, v_max)]:
-        p = x_axis * u + y_axis * v
-        corners.append((int(round(float(p[0]))), int(round(float(p[1])))))
-    return corners
-
-
-# ═══════════════════════════════════════════════════════════
-#  ① ROI 提取：投影法定位刻度区域
-# ═══════════════════════════════════════════════════════════
-
 def locate_roi_lowres(img_color: np.ndarray,
-                      max_width: int = 1600) -> dict:
-    template_result = _locate_roi_by_screw_template(img_color)
-    if template_result is not None:
-        return template_result
-
+                       max_width: int = 1600) -> dict:
     timings = {}
 
     def mark(key: str, start_time: float):
@@ -444,20 +59,47 @@ def locate_roi_lowres(img_color: np.ndarray,
 
     t0 = time.perf_counter()
     x1, x2, x_diag = _proj_find_x_range(fg, y1, y2, sw)
+    x1, x2, body_x_info = _guard_x_range_with_full_body(
+        enhanced, y1, y2, x1, x2, x_diag
+    )
+    if x_diag is not None:
+        x_diag['full_y_body'] = body_x_info
     mark('vertical_projection', t0)
     if y2 - y1 < config.roi.min_roi_height or x2 - x1 < config.roi.min_roi_width:
         return _lowres_roi_failure(timings, (x1, y1, x2, y2), scale)
 
     t0 = time.perf_counter()
+    projection_box = (y1, y2, x1, x2)
     refined = _refine_roi_by_vernier_block(enhanced, y1, y2, x1, x2, timings)
+    y_refinement_fallback = None
     if refined is not None:
-        y1, y2, x1, x2 = refined
+        if _refined_y_preserves_tick_support(enhanced, projection_box, refined):
+            y1, y2, x1, x2 = refined
+        else:
+            # Keep the reliable horizontal boundary but restore the projected
+            # vertical band when refinement cuts through real scale marks.
+            y1, y2 = projection_box[:2]
+            x1, x2 = refined[2:]
+            y_refinement_fallback = 'body_y_lost_tick_support'
     mark('refine_vernier_block', t0)
 
     t0 = time.perf_counter()
-    reading_refined = _refine_roi_to_reading_window(enhanced, y1, y2, x1, x2, x_diag)
-    if reading_refined is not None:
-        y1, y2, x1, x2 = reading_refined
+    body_box = (y1, y2, x1, x2)
+    vertical_tick_trim = None
+    if y_refinement_fallback is not None:
+        vertical_tick_trim = _trim_roi_bottom_to_vertical_tick_support(
+            enhanced, body_box, x_diag
+        )
+        if vertical_tick_trim is not None:
+            body_box = vertical_tick_trim
+    selected_box, selection_info = _select_reading_roi_candidate(
+        enhanced, projection_box, body_box, x_diag
+    )
+    if y_refinement_fallback is not None:
+        selection_info['y_refinement_fallback'] = y_refinement_fallback
+    if vertical_tick_trim is not None:
+        selection_info['vertical_tick_bottom_trim'] = vertical_tick_trim
+    y1, y2, x1, x2 = selected_box
     mark('refine_reading_window', t0)
 
     t0 = time.perf_counter()
@@ -479,10 +121,43 @@ def locate_roi_lowres(img_color: np.ndarray,
         return _lowres_roi_failure(timings, (x1, y1, x2, y2), scale)
 
     crop = img_color[oy1:oy2, ox1:ox2].copy()
+    recovery_candidates = []
+    compact_box = selection_info['candidate_boxes'].get('compact')
+    if (selection_info.get('selected_stage') == 'compact'
+            and compact_box is not None):
+        for candidate in _build_local_roi_recovery_candidates(compact_box, body_box):
+            cy1, cy2, cx1, cx2 = candidate['box']
+            cox1 = int(np.floor(cx1 * inv_scale))
+            coy1 = int(np.floor(cy1 * inv_scale))
+            cox2 = int(np.ceil((cx2 + 1) * inv_scale))
+            coy2 = int(np.ceil((cy2 + 1) * inv_scale))
+            candidate_w = max(1, cox2 - cox1)
+            candidate_h = max(1, coy2 - coy1)
+            cox1 = max(0, cox1 - max(30, int(candidate_w * 0.015)))
+            coy1 = max(0, coy1 - max(15, int(candidate_h * 0.040)))
+            cox2 = min(w, cox2 + max(30, int(candidate_w * 0.015)))
+            coy2 = min(h, coy2 + max(15, int(candidate_h * 0.040)))
+            recovery_candidates.append({
+                **candidate,
+                'roi_box_original': (cox1, coy1, cox2, coy2),
+            })
     mark('map_and_crop', t0)
     t0 = time.perf_counter()
+    candidate_boxes_original = {}
+    for stage, box in selection_info['candidate_boxes'].items():
+        if box is None:
+            continue
+        by1, by2, bx1, bx2 = box
+        candidate_boxes_original[stage] = (
+            max(0, int(np.floor(bx1 * inv_scale))),
+            max(0, int(np.floor(by1 * inv_scale))),
+            min(w, int(np.ceil((bx2 + 1) * inv_scale))),
+            min(h, int(np.ceil((by2 + 1) * inv_scale))),
+        )
     roi_debug = _make_roi_location_vis(
-        img_color, (ox1, oy1, ox2, oy2), crop, 'lowres_projection'
+        img_color, (ox1, oy1, ox2, oy2), crop,
+        'lowres_' + selection_info['selected_stage'],
+        candidate_boxes_original, selection_info['selected_stage'],
     )
     mark('roi_debug_vis', t0)
     return {
@@ -495,14 +170,18 @@ def locate_roi_lowres(img_color: np.ndarray,
         'lowres_debug': roi_debug,
         'roi_timings': timings,
         'locate_failed': False,
-        'roi_source': 'lowres_projection',
+        'roi_source': 'lowres_' + selection_info['selected_stage'],
+        'roi_selection': selection_info,
+        'roi_recovery_candidates': recovery_candidates,
     }
 
 
 def _make_roi_location_vis(img_color: np.ndarray,
                            roi_box: tuple,
                            roi_crop: np.ndarray,
-                           source: str) -> np.ndarray:
+                           source: str,
+                           candidate_boxes: dict = None,
+                           selected_stage: str = None) -> np.ndarray:
     if img_color is None or roi_box is None:
         return None
     h, w = img_color.shape[:2]
@@ -518,10 +197,28 @@ def _make_roi_location_vis(img_color: np.ndarray,
     else:
         overview = cv2.resize(img_color, (view_w, view_h), interpolation=cv2.INTER_AREA)
 
+    if candidate_boxes:
+        colors = {
+            'projection': (255, 180, 0),
+            'body': (0, 200, 255),
+            'compact': (255, 90, 180),
+        }
+        for stage, box in candidate_boxes.items():
+            if box is None:
+                continue
+            bx1, by1, bx2, by2 = box
+            p1 = (int(round(bx1 * scale)), int(round(by1 * scale)))
+            p2 = (int(round(bx2 * scale)), int(round(by2 * scale)))
+            thickness = 3 if stage == selected_stage else 1
+            cv2.rectangle(overview, p1, p2, colors.get(stage, (180, 180, 180)), thickness, cv2.LINE_AA)
+
     x1, y1, x2, y2 = roi_box
     p1 = (int(round(x1 * scale)), int(round(y1 * scale)))
     p2 = (int(round(x2 * scale)), int(round(y2 * scale)))
-    cv2.rectangle(overview, p1, p2, (0, 255, 120), 3, cv2.LINE_AA)
+    if not candidate_boxes:
+        cv2.rectangle(overview, p1, p2, (0, 255, 120), 3, cv2.LINE_AA)
+    else:
+        cv2.rectangle(overview, p1, p2, (0, 255, 120), 3, cv2.LINE_AA)
     cv2.putText(
         overview, f"ROI: {source}", (12, 28),
         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA
@@ -900,6 +597,258 @@ def _refine_roi_to_reading_window(enhanced: np.ndarray,
     return y1, y2, x1 + nx1, x1 + nx2
 
 
+def _select_reading_roi_candidate(enhanced: np.ndarray,
+                                  projection_box: tuple,
+                                  body_box: tuple,
+                                  x_diag: dict = None,
+                                  compact_builder=None,
+                                  structure_validator=None) -> tuple:
+    """Use a compact ROI only when measured reading structure remains intact."""
+    compact_builder = compact_builder or _refine_roi_to_reading_window
+    structure_validator = structure_validator or _reading_roi_preserves_structure
+    compact = compact_builder(enhanced, *body_box, x_diag) if body_box is not None else None
+    info = {
+        'candidate_boxes': {
+            'projection': projection_box,
+            'body': body_box,
+            'compact': compact,
+        },
+        'selected_stage': 'body',
+        'fallback_reason': None,
+    }
+    if compact is not None and structure_validator(enhanced, compact, x_diag):
+        info['selected_stage'] = 'compact'
+        return compact, info
+    if compact is not None:
+        info['fallback_reason'] = 'compact_structure_invalid'
+    if body_box is not None:
+        return body_box, info
+    info['selected_stage'] = 'projection'
+    info['fallback_reason'] = 'body_unavailable'
+    return projection_box, info
+
+
+def _build_local_roi_recovery_candidates(compact_box: tuple,
+                                         body_box: tuple) -> list:
+    """Return small x-only compact-ROI expansions bounded by the body ROI."""
+    if compact_box is None or body_box is None:
+        return []
+    y1, y2, x1, x2 = (int(value) for value in compact_box)
+    _, _, body_x1, body_x2 = (int(value) for value in body_box)
+    if y2 <= y1 or x2 <= x1:
+        return []
+
+    body_x1 = min(body_x1, x1)
+    body_x2 = max(body_x2, x2)
+    left_room = max(0, x1 - body_x1)
+    right_room = max(0, body_x2 - x2)
+    base_area = (x2 - x1) * (y2 - y1)
+    raw = []
+
+    def add(name: str, left_ratio: float, right_ratio: float):
+        left = int(round(left_room * left_ratio))
+        right = int(round(right_room * right_ratio))
+        nx1 = max(body_x1, x1 - left)
+        nx2 = min(body_x2, x2 + right)
+        if nx2 <= nx1 or (nx1 == x1 and nx2 == x2):
+            return
+        raw.append({
+            'name': name,
+            'box': (y1, y2, nx1, nx2),
+            'added_area': (nx2 - nx1) * (y2 - y1) - base_area,
+        })
+
+    add('left_1_3', 1.0 / 3.0, 0.0)
+    add('right_1_3', 0.0, 1.0 / 3.0)
+    add('left_2_3', 2.0 / 3.0, 0.0)
+    add('right_2_3', 0.0, 2.0 / 3.0)
+    add('both_1_3', 1.0 / 3.0, 1.0 / 3.0)
+
+    unique = {}
+    for candidate in raw:
+        unique.setdefault(candidate['box'], candidate)
+    return sorted(unique.values(), key=lambda item: (item['added_area'], item['name']))
+
+
+def _guard_x_range_with_full_body(enhanced: np.ndarray,
+                                  y1: int, y2: int,
+                                  x1: int, x2: int,
+                                  x_diag: dict = None) -> tuple:
+    """Reject a ruler-tail span when it covers too little of the full-y body."""
+    info = {'expanded_for_body': False, 'body_range': None}
+    if enhanced is None:
+        return x1, x2, info
+    h, w = enhanced.shape[:2]
+    y1 = max(0, int(y1))
+    y2 = min(h - 1, int(y2))
+    x1 = max(0, int(x1))
+    x2 = min(w - 1, int(x2))
+    if y2 <= y1 or x2 <= x1:
+        return x1, x2, info
+
+    body_x1, body_x2 = _find_vernier_body_x_range(enhanced[y1:y2 + 1, :])
+    body_x1 = max(0, int(body_x1))
+    body_x2 = min(w - 1, int(body_x2))
+    body_w = body_x2 - body_x1
+    if body_w < max(80, int(w * 0.12)):
+        return x1, x2, info
+
+    info['body_range'] = (body_x1, body_x2)
+    overlap = max(0, min(x2, body_x2) - max(x1, body_x1))
+    if overlap >= body_w * 0.55:
+        return x1, x2, info
+
+    tick_gap = _reading_window_tick_gap(x_diag, body_w)
+    left_margin = max(int(tick_gap * 12), int(body_w * 0.15))
+    right_margin = max(int(tick_gap * 5), int(body_w * 0.08))
+    info['expanded_for_body'] = True
+    return (
+        max(0, body_x1 - left_margin),
+        min(w - 1, body_x2 + right_margin),
+        info,
+    )
+
+
+def _refined_y_preserves_tick_support(enhanced: np.ndarray,
+                                      projection_box: tuple,
+                                      refined_box: tuple) -> bool:
+    """Ensure vertical refinement does not crop the top of observed tick support."""
+    if enhanced is None or projection_box is None or refined_box is None:
+        return False
+    py1, py2, px1, px2 = (int(value) for value in projection_box)
+    ry1 = int(refined_box[0])
+    if py2 <= py1 or px2 <= px1:
+        return False
+
+    crop = enhanced[py1:py2 + 1, px1:px2 + 1]
+    if crop.size == 0:
+        return False
+    block_size = _odd_between(min(crop.shape) // 18, 15, 51)
+    binary = cv2.adaptiveThreshold(
+        crop, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+        block_size, 9,
+    )
+    kernel_h = max(7, min(31, int(round(crop.shape[0] * 0.12))))
+    if kernel_h % 2 == 0:
+        kernel_h += 1
+    vertical = cv2.morphologyEx(
+        binary, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h)),
+    )
+    row_support = np.mean(vertical > 0, axis=1)
+    floor = max(0.003, float(np.percentile(row_support, 72)) * 0.35)
+    rows = np.flatnonzero(row_support >= floor)
+    if rows.size == 0:
+        return False
+
+    support_top = py1 + int(rows[0])
+    tolerance = max(4, int((py2 - py1) * 0.04))
+    return ry1 <= support_top + tolerance
+
+
+def _trim_roi_bottom_to_vertical_tick_support(enhanced: np.ndarray,
+                                              roi_box: tuple,
+                                              x_diag: dict = None):
+    """Tighten a fallback ROI below its strongest observed vertical tick run."""
+    if enhanced is None or roi_box is None:
+        return None
+    h, w = enhanced.shape[:2]
+    y1, y2, x1, x2 = (int(value) for value in roi_box)
+    if not (0 <= y1 < y2 < h and 0 <= x1 < x2 < w):
+        return None
+
+    crop = enhanced[y1:y2 + 1, x1:x2 + 1]
+    if crop.shape[0] < 80 or crop.shape[1] < 160:
+        return None
+    binary = cv2.adaptiveThreshold(
+        crop, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+        31, 9,
+    )
+    kernel_h = max(7, min(61, int(round(crop.shape[0] * 0.12))))
+    if kernel_h % 2 == 0:
+        kernel_h += 1
+    vertical = cv2.morphologyEx(
+        binary, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h)),
+    )
+    row_support = np.mean(vertical > 0, axis=1)
+    floor = max(0.003, float(np.percentile(row_support, 75)) * 0.35)
+    active = np.flatnonzero(row_support >= floor)
+    if active.size == 0:
+        return None
+
+    runs = [run for run in np.split(active, np.where(np.diff(active) > 1)[0] + 1)
+            if run.size >= max(8, kernel_h // 3)]
+    if not runs:
+        return None
+    strongest = max(
+        runs,
+        key=lambda run: (float(np.mean(row_support[run])), int(run.size)),
+    )
+    tick_gap = _reading_window_tick_gap(x_diag, x2 - x1)
+    reserve = max(30, int(round(tick_gap * 7.0)))
+    new_y2 = min(y2, y1 + int(strongest[-1]) + reserve)
+    if new_y2 >= y2 - max(12, int(round(tick_gap * 1.5))):
+        return None
+    if new_y2 - y1 < max(80, int(crop.shape[0] * 0.45)):
+        return None
+    return y1, new_y2, x1, x2
+
+
+def _reading_roi_preserves_structure(enhanced: np.ndarray,
+                                     roi_box: tuple,
+                                     x_diag: dict = None) -> bool:
+    """Verify that a compact reading window preserves the dual scale structure."""
+    if enhanced is None or roi_box is None:
+        return False
+    h, w = enhanced.shape[:2]
+    y1, y2, x1, x2 = (int(v) for v in roi_box)
+    if not (0 <= y1 < y2 < h and 0 <= x1 < x2 < w):
+        return False
+
+    crop = enhanced[y1:y2 + 1, x1:x2 + 1]
+    crop_h, crop_w = crop.shape[:2]
+    if crop_h < 48 or crop_w < 80:
+        return False
+
+    projected_left = x_diag.get('x1') if x_diag else None
+    full_y_body = x_diag.get('full_y_body', {}) if x_diag else {}
+    body_range = full_y_body.get('body_range') if isinstance(full_y_body, dict) else None
+    body_coverage = 0.0
+    if body_range is not None:
+        body_x1, body_x2 = (float(value) for value in body_range)
+        body_width = max(1.0, body_x2 - body_x1)
+        body_overlap = max(0.0, min(float(x2), body_x2) - max(float(x1), body_x1))
+        body_coverage = body_overlap / body_width
+
+    if projected_left is not None and body_coverage < 0.90:
+        tick_gap = float(x_diag.get('tick_gap', 0.0) or 0.0)
+        if x1 > float(projected_left) + max(2.0 * tick_gap, 0.03 * w):
+            return False
+
+    block_size = _odd_between(min(crop.shape) // 18, 15, 51)
+    binary = cv2.adaptiveThreshold(
+        crop, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+        block_size, 9,
+    )
+    kernel_h = max(7, min(31, int(round(crop_h * 0.12))))
+    kernel_h = kernel_h if kernel_h % 2 else kernel_h + 1
+    vertical = cv2.morphologyEx(
+        binary, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h)),
+    )
+    row_support = np.mean(vertical > 0, axis=1)
+    support_floor = max(0.003, float(np.percentile(row_support, 72)) * 0.35)
+    rows = np.flatnonzero(row_support >= support_floor)
+    if rows.size == 0:
+        return False
+
+    # The projection's left boundary protects the main-scale reference.  The
+    # vertical response only needs to establish that scale marks remain; a
+    # full-height body crop may legitimately merge the two scale bands.
+    return rows.size >= max(8, crop_h // 24)
+
+
 def _reading_window_tick_gap(x_diag: dict, body_w: int) -> float:
     if x_diag:
         try:
@@ -1225,14 +1174,12 @@ def _seam_seed_candidates(gray: np.ndarray,
     h, w = gray.shape[:2]
     seeds = []
     try:
-        from .region_split import _split_by_vernier_tick_band, _split_by_gray_seam
-        first = _split_by_vernier_tick_band(gray, fg, h, w)
-        second = _split_by_gray_seam(gray, h, w)
-        if first is not None:
-            seeds.append(int(first))
-        if second is not None:
-            seeds.append(int(second))
-    except Exception:
+        from .region_split import _analyze_horizontal_tick_bands, _split_from_tick_band_valley
+        band_info = _analyze_horizontal_tick_bands(gray, fg)
+        split_y = _split_from_tick_band_valley(band_info)
+        if split_y is not None:
+            seeds.append(int(split_y))
+    except (ValueError, FloatingPointError, OverflowError, cv2.error):
         pass
     seeds.extend([int(h * 0.58), int(h * 0.64), int(h * 0.70)])
 

@@ -25,7 +25,7 @@ def preprocess(img: np.ndarray,
         clip_limit:      CLAHE 对比度限制（None=使用 config.preprocess.clahe_clip_limit）
         bilateral_d:     双边滤波直径（None=使用 config）
         bilateral_sigma: 双边滤波 sigma（None=使用 config）
-        gamma:           幂律变换 gamma 值（None=使用 config → 1.0=不变；<1 提亮暗部；>1 压暗高光）
+        gamma:           幂律变换 gamma 值（None=使用 config → 1.0=不变；<1 压暗中间调；>1 提亮中间调）
         median_ksize:    中值滤波核尺寸（None=使用 config；奇数>=3；设为 0 跳过）
 
     Returns:

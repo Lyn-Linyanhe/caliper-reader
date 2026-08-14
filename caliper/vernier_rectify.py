@@ -1,4 +1,9 @@
-"""Crop the vernier body after the main/vernier split."""
+"""Vernier-body geometry helpers and future rectification experiments.
+
+``_find_vernier_body_x_range`` is part of the active ROI path.  The public
+whole-region crop helper is retained as a research/future-integration path;
+it is intentionally not called by the production reader today.
+"""
 
 import cv2
 import numpy as np

@@ -10,7 +10,21 @@ import numpy as np
 import time
 from typing import List
 
+from .config import config
 from .result import CaliperResult, DigitInfo
+
+
+def _with_alignment_totals(main_reading: float, ambiguity: dict) -> dict:
+    if not ambiguity:
+        return None
+    result = dict(ambiguity)
+    result['primary_total'] = round(
+        float(main_reading) + float(result['primary_reading']), 2
+    )
+    result['reference_total'] = round(
+        float(main_reading) + float(result['reference_reading']), 2
+    )
+    return result
 
 
 def merge_readings(main_result: dict,
@@ -74,6 +88,9 @@ def merge_readings(main_result: dict,
 
     # ── 总读数 ──
     total = main_reading + vernier_reading
+    alignment_ambiguity = _with_alignment_totals(
+        main_reading, vernier_result.get('alignment_ambiguity')
+    )
 
     # ── 置信度 ──
     confidence = calc_confidence(main_ticks, vernier_ticks, precision)
@@ -124,6 +141,7 @@ def merge_readings(main_result: dict,
             'zero_x': zero_x,
             'main_digits': [(d.text, d.value, d.x) for d in main_digits],
             'main_derivation': main_derivation,
+            'alignment_ambiguity': alignment_ambiguity,
             'derivation_vis': derivation_vis,
             'merge_timings': merge_timings,
         },
@@ -189,109 +207,227 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
         from .main_scale import find_nearest_cm_digit_region, find_digit_cc_candidates
         mark('import_ocr_helpers', t0)
 
-        t0 = time.perf_counter()
-        binary_crop, x_off, y_off = find_nearest_cm_digit_region(
-            main_ticks, main_gap, zero_x, binary_region)
-        mark('find_digit_region', t0)
-        if binary_crop is None:
-            return _ocr_failed_reading('no_digit_region')
+        reader = None
+        engine = None
+
+        def run_ocr_attempt(vertical_expand_gaps: float,
+                            timing_suffix: str,
+                            prefer_long_ticks: bool = False) -> dict:
+            nonlocal reader, engine
+
+            t1 = time.perf_counter()
+            binary_crop, x_off, y_off = find_nearest_cm_digit_region(
+                main_ticks, main_gap, zero_x, binary_region,
+                vertical_expand_gaps=vertical_expand_gaps,
+                prefer_long_ticks=prefer_long_ticks,
+            )
+            mark(f'find_digit_region{timing_suffix}', t1)
+            if binary_crop is None:
+                return {'reason': 'no_digit_region', 'engine': engine}
+
+            crop_info = (
+                int(x_off), int(y_off),
+                int(binary_crop.shape[1]), int(binary_crop.shape[0]),
+            )
+            t1 = time.perf_counter()
+            cc_candidates = find_digit_cc_candidates(
+                binary_crop, x_off, y_off, zero_x
+            )
+            mark(f'find_digit_cc_candidates{timing_suffix}', t1)
+            if not cc_candidates:
+                return {
+                    'reason': 'no_digit_component',
+                    'engine': engine,
+                    'crop_info': crop_info,
+                }
+
+            if reader is None:
+                t1 = time.perf_counter()
+                reader = get_ocr_reader_singleton()
+                engine = (reader.engine_status() if hasattr(reader, 'engine_status')
+                          else reader.engine_name())
+                mark(f'get_ocr_reader{timing_suffix}', t1)
+
+            char_candidates = []
+            t1 = time.perf_counter()
+            for cc in cc_candidates:
+                digit = reader.ocr_patch_to_digit(
+                    cc['digit_crop'], cc['bbox'], gray_region
+                )
+                if digit is None or digit.value < 0:
+                    continue
+                char_candidates.append({
+                    'digit': digit,
+                    'value': digit.value,
+                    'text': digit.text,
+                    'confidence': digit.confidence,
+                    'bbox': cc['bbox'],
+                    'cc_confidence': cc['confidence'],
+                    'center_x': cc['center_x'],
+                    'source': 'single_char',
+                })
+            mark(f'ocr_digit_patches{timing_suffix}', t1)
+
+            t1 = time.perf_counter()
+            ocr_candidates = _group_main_ocr_labels(
+                char_candidates, main_ticks, main_gap
+            )
+            mark(f'group_ocr_labels{timing_suffix}', t1)
+            if not ocr_candidates:
+                return {
+                    'reason': 'ocr_no_digit',
+                    'engine': engine,
+                    'crop_info': crop_info,
+                }
+            return {
+                'reason': None,
+                'engine': engine,
+                'ocr_candidates': ocr_candidates,
+                'crop_info': crop_info,
+            }
+
+        attempt = run_ocr_attempt(0.0, '')
+        vertical_retry_used = attempt.get('reason') in {
+            'no_digit_component', 'ocr_no_digit'
+        }
+        if vertical_retry_used:
+            attempt = run_ocr_attempt(1.0, '_expanded_retry')
+
+        long_tick_retry_used = False
+        if attempt.get('reason') in {'no_digit_component', 'ocr_no_digit'}:
+            long_tick_retry_used = True
+            attempt = run_ocr_attempt(
+                0.0, '_long_tick_retry', prefer_long_ticks=True
+            )
+
+        retry_info = {
+            'ocr_expanded_retry_used': vertical_retry_used,
+            'ocr_long_tick_retry_used': long_tick_retry_used,
+            'ocr_vertical_expand_gaps': 1.0 if vertical_retry_used else 0.0,
+            'ocr_crop': attempt.get('crop_info'),
+        }
+        if attempt.get('reason'):
+            return _ocr_failed_reading(
+                attempt['reason'],
+                ocr_engine=attempt.get('engine'),
+                **retry_info,
+            )
+
+        engine = attempt.get('engine')
+        ocr_candidates = attempt['ocr_candidates']
 
         t0 = time.perf_counter()
-        cc_candidates = find_digit_cc_candidates(binary_crop, x_off, y_off, zero_x)
-        mark('find_digit_cc_candidates', t0)
-        if not cc_candidates:
-            return _ocr_failed_reading('no_digit_component')
-
-        t0 = time.perf_counter()
-        reader = get_ocr_reader_singleton()
-        engine = reader.engine_status() if hasattr(reader, 'engine_status') else reader.engine_name()
-        mark('get_ocr_reader', t0)
-        char_candidates = []
-        t0 = time.perf_counter()
-        for cc in cc_candidates:
-            digit = reader.ocr_patch_to_digit(cc['digit_crop'], cc['bbox'], gray_region)
-            if digit is None or digit.value < 0:
-                continue
-            char_candidates.append({
-                'digit': digit,
-                'value': digit.value,
-                'text': digit.text,
-                'confidence': digit.confidence,
-                'bbox': cc['bbox'],
-                'cc_confidence': cc['confidence'],
-                'center_x': cc['center_x'],
-                'source': 'single_char',
-            })
-        mark('ocr_digit_patches', t0)
-
-        t0 = time.perf_counter()
-        ocr_candidates = _group_main_ocr_labels(char_candidates, main_ticks, main_gap)
-        mark('group_ocr_labels', t0)
-        if not ocr_candidates:
-            return _ocr_failed_reading('ocr_no_digit', ocr_engine=engine)
-
-        t0 = time.perf_counter()
-        side_tol = max(4.0, main_gap * 0.20)
-        usable = [c for c in ocr_candidates if c['ref_tick_x'] <= zero_x + side_tol]
-        if not usable:
-            return _ocr_failed_reading('no_ocr_digit_left_of_zero', ocr_engine=engine)
-        selected = max(
-            usable,
-            key=lambda c: (c['ref_tick_x'], c['confidence'], c['cc_confidence'])
+        selected, label_selection = _select_main_label_for_zero(
+            ocr_candidates, zero_x, main_gap
         )
+        if selected is None:
+            return _ocr_failed_reading(
+                'no_ocr_digit_left_of_zero', ocr_engine=engine, **retry_info
+            )
         digit = selected['digit']
         ref_x = selected['ref_tick_x']
-        extra_ticks = sum(1 for x in main_xs if ref_x + main_gap * 0.3 < x <= zero_x)
-        reading = float(digit.value) * 10 + extra_ticks
+        extra_ticks = _count_main_ticks_between_label_and_zero(
+            main_xs, ref_x, zero_x, main_gap
+        )
+        main_integer = int(selected['value'])
+        reading = float(main_integer) * 10 + extra_ticks
         mark('select_and_compute', t0)
         return reading, {
             'nearest_digit': digit,
             'extra_ticks': extra_ticks,
             'strategy': 'ocr',
+            'ocr_label_selection': label_selection,
+            'ocr_selected_main_integer': main_integer,
             'ref_tick_x': ref_x,
             'ocr_text': digit.text,
             'ocr_confidence': digit.confidence,
             'ocr_engine': engine,
             'ocr_candidates': _summarize_ocr_candidates(ocr_candidates, selected),
             'ocr_timings': ocr_timings,
+            **retry_info,
         }
 
     return _ocr_failed_reading('missing_ocr_inputs')
 
 
 def _ocr_failed_reading(reason: str,
-                        ocr_engine: str = None) -> tuple:
-    return 0.0, {
+                         ocr_engine: str = None,
+                         **extra_info) -> tuple:
+    info = {
         'nearest_digit': None,
         'extra_ticks': 0,
         'strategy': 'ocr_failed',
         'ocr_reason': reason,
         'ocr_engine': ocr_engine,
     }
+    info.update(extra_info)
+    return 0.0, info
 
 
-def _bind_digit_to_cm_tick(digit: DigitInfo,
-                           main_ticks: List[dict],
-                           main_gap: float) -> dict:
-    if digit is None or not main_ticks or main_gap <= 0:
-        return None
-    return _bind_label_x_to_cm_tick(float(digit.x), main_ticks, main_gap, tolerance_ratio=0.65)
-
-
-def _bind_label_x_to_cm_tick(label_x: float,
+def _bind_label_to_main_tick(label_x: float,
                              main_ticks: List[dict],
                              main_gap: float,
-                             tolerance_ratio: float = 0.65) -> dict:
+                             tolerance_ratio: float = 0.45) -> dict:
     if label_x is None or not main_ticks or main_gap <= 0:
         return None
-    cm_ticks = _main_cm_ticks(main_ticks, main_gap)
-    if not cm_ticks:
-        return None
     center_x = float(label_x)
-    nearest = min(cm_ticks, key=lambda t: abs(float(t['x']) - center_x))
+    nearest = min(main_ticks, key=lambda t: abs(float(t['x']) - center_x))
     if abs(float(nearest['x']) - center_x) > max(8.0, main_gap * tolerance_ratio):
         return None
     return nearest
+
+
+def _select_main_label_for_zero(ocr_candidates: list,
+                                zero_x: float,
+                                main_gap: float) -> tuple:
+    """Select the label to the left of zero, or the adjacent right label - 1."""
+    side_tol = max(4.0, float(main_gap) * 0.20)
+    left = [
+        candidate for candidate in ocr_candidates
+        if float(candidate['ref_tick_x']) <= float(zero_x) + side_tol
+    ]
+    if left:
+        return max(
+            left,
+            key=lambda candidate: (
+                candidate['ref_tick_x'], candidate['confidence'],
+                candidate['cc_confidence'],
+            ),
+        ), 'left_of_zero'
+
+    right = [
+        candidate for candidate in ocr_candidates
+        if (0.0 < float(candidate['ref_tick_x']) - float(zero_x)
+                <= float(main_gap) + side_tol
+                and int(candidate['value']) > 0)
+    ]
+    if not right:
+        return None, None
+
+    source = min(
+        right,
+        key=lambda candidate: (
+            candidate['ref_tick_x'], -candidate['confidence'],
+            -candidate['cc_confidence'],
+        ),
+    )
+    selected = dict(source)
+    selected['value'] = int(source['value']) - 1
+    selected['text'] = str(selected['value'])
+    return selected, 'right_of_zero_minus_one'
+
+
+def _count_main_ticks_between_label_and_zero(main_xs: list,
+                                              ref_x: float,
+                                              zero_x: float,
+                                              main_gap: float) -> int:
+    """Count main ticks up to zero, allowing subpixel zero/tick matching."""
+    if not main_xs or main_gap <= 0:
+        return 0
+    lower = float(ref_x) + float(main_gap) * 0.30
+    zero_match_tolerance = max(1.0, float(main_gap) * 0.04)
+    upper = float(zero_x) + zero_match_tolerance
+    return sum(lower < float(x) <= upper for x in main_xs)
 
 
 def _group_main_ocr_labels(char_candidates: list,
@@ -302,7 +438,7 @@ def _group_main_ocr_labels(char_candidates: list,
 
     chars = sorted(char_candidates, key=lambda c: (c.get('bbox') or (c.get('center_x', 0),))[0])
     grouped = []
-    gap_tol = max(6.0, main_gap * 0.45)
+    gap_tol = max(6.0, main_gap * config.ocr.main_label_group_gap_ratio)
     i = 0
     while i < len(chars):
         cur = chars[i]
@@ -352,42 +488,13 @@ def _group_main_ocr_labels(char_candidates: list,
 
     labels = []
     for label in grouped:
-        tolerance_ratio = 1.2 if label.get('source') == 'grouped_2digit' else 0.65
-        ref_tick = _bind_label_x_to_cm_tick(label.get('center_x'), main_ticks, main_gap, tolerance_ratio)
+        ref_tick = _bind_label_to_main_tick(label.get('center_x'), main_ticks, main_gap)
         if ref_tick is None:
             continue
         label = dict(label)
         label['ref_tick_x'] = float(ref_tick['x'])
         labels.append(label)
     return labels
-
-
-def _main_cm_ticks(main_ticks: List[dict], main_gap: float) -> List[dict]:
-    if not main_ticks:
-        return []
-    long_ticks = [t for t in main_ticks if t.get('is_long')]
-    lengths = [float(t.get('length', 0)) for t in main_ticks]
-    if not lengths:
-        return []
-    median_len = float(np.median(lengths))
-    secondary = [t for t in main_ticks if float(t.get('length', 0)) >= median_len * 1.18]
-    if len(secondary) > len(long_ticks):
-        long_ticks = secondary
-    if not long_ticks:
-        return []
-
-    tol = max(3.0, main_gap * 0.25)
-    groups = []
-    for tick in sorted(long_ticks, key=lambda t: float(t['x'])):
-        if not groups or float(tick['x']) - float(groups[-1][-1]['x']) > tol:
-            groups.append([tick])
-        else:
-            groups[-1].append(tick)
-
-    deduped = []
-    for group in groups:
-        deduped.append(max(group, key=lambda t: float(t.get('length', 0))))
-    return deduped
 
 
 def _dedupe_main_xs(xs: list, main_gap: float) -> list:

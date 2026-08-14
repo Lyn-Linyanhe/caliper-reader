@@ -1,22 +1,16 @@
-"""
-步骤 2 — 区域分离：主尺 / 游标尺
+"""Step 2: split the main-scale and vernier-scale regions.
 
-策略（v4 — 投影突变法优先）：
-  ROI 矫正后刻线垂直，主尺与游标尺之间是深色分界带。
-  直接做水平像素投影，找中间区域最深的波谷（突变点）即为分界线。
-
-  方案A（优先）：水平像素投影 → 找中间区域最深波谷（突变点）
-    原理：刻度区像素值高（亮），分界带像素值低（暗），投影曲线在分界处骤降。
-  方案B（回退）：灰度图 Sobel Y 方向梯度 → 水平投影 → 找最大梯度峰
-    原理：黑线上下沿产生强烈的垂直梯度，投影后形成峰值。
-  方案C（回退）：二值图 + 宽水平核闭运算 → 连通刻线 → 投影找窄谷
-    原理：用超宽核把刻线连成片，黑线变成唯一的水平断点。
+The active path keeps thin vertical foreground components with a vertical
+opening, builds row support from those components, and first estimates the
+seam from component endpoints.  A valley bounded by two supported tick bands
+is the fallback; a physical height ratio is the final fallback.  The old
+gradient/closing/candidate-scan descriptions are historical configuration
+notes, not executable branches.
 """
 
 import cv2
 import numpy as np
 
-from .utils import draw_projection_plot
 from .config import config
 
 
@@ -36,27 +30,36 @@ def split_scales(rotated_gray: np.ndarray,
     else:
         binary = rotated_binary
 
-    # Use the physical seam itself as the split.  Downstream recognition should
-    # work from the true main/vernier boundary instead of an artificially
-    # shifted crop line.
-    split_y = _split_by_vernier_tick_band(rotated_gray, binary, h, w)
+    band_info = _analyze_horizontal_tick_bands(rotated_gray, binary)
+    split_y, seam_info = (( _find_component_endpoint_seam(band_info, h))
+                          if config.region_split.seam_use_component_endpoints else (None, {}))
+    seam_source = 'component_endpoints'
     if split_y is None:
-        split_y = _split_by_gray_seam(rotated_gray, h, w)
-    if split_y is None:
-        split_y = _split_by_candidate_scan(rotated_gray, binary, h, w)
+        split_y = _split_from_tick_band_valley(band_info)
+        seam_source = 'projection_valley'
 
     # ── 最终回退（基于物理先验：主尺约占ROI高度的60%）──
     if split_y is None:
         split_y = int(h * config.region_split.fallback_split_ratio)
+        seam_source = 'physical_ratio'
 
     # ── 游标区域高度校验：不能太小（至少占ROI的 min_ratio）──
     min_vernier_h = int(h * config.region_split.min_vernier_height_ratio)
     if h - split_y < min_vernier_h:
         split_y = h - min_vernier_h
 
-    band_info = _analyze_horizontal_tick_bands(rotated_gray, binary, split_y)
-    main_band = band_info.get('main_tick_band', (max(0, split_y - max(24, h // 3)), split_y))
-    vernier_band = band_info.get('vernier_tick_band', (split_y, min(h, split_y + max(24, h // 4))))
+    band_info = _analyze_horizontal_tick_bands(
+        rotated_gray, binary, split_y, projection=band_info
+    )
+    endpoint_bands = _tick_bands_from_component_endpoints(band_info, split_y, h, seam_info)
+    main_band = endpoint_bands.get('main_tick_band') or band_info.get(
+        'main_tick_band', (max(0, split_y - max(24, h // 3)), split_y)
+    )
+    vernier_band = endpoint_bands.get('vernier_tick_band') or band_info.get(
+        'vernier_tick_band', (split_y, min(h, split_y + max(24, h // 4)))
+    )
+    band_info.update(seam_info)
+    band_info.update(endpoint_bands)
 
     # ── 切分 ──
     img_upper = rotated_gray[:split_y, :]
@@ -92,114 +95,10 @@ def split_scales(rotated_gray: np.ndarray,
         'region_main': region_main,
         'region_vernier': region_vernier,
         'split_y': split_y,
+        'seam_source': seam_source,
         'tick_bands': band_info,
         'split_vis': split_vis,
     }
-
-
-def _split_by_vernier_tick_band(gray: np.ndarray, binary: np.ndarray,
-                                h: int, w: int):
-    """用中心区域梯度最大处定位分界线。"""
-    lo, hi = int(h * 0.42), int(h * 0.84)
-    if hi <= lo:
-        return None
-
-    x1, x2 = int(w * 0.28), int(w * 0.70)
-    if x2 <= x1:
-        x1, x2 = 0, w
-
-    row_mean = np.mean(gray[:, x1:x2], axis=1).astype(float)
-    win = max(7, h // 70)
-    if win % 2 == 0:
-        win += 1
-    kernel = np.ones(win, dtype=float) / win
-    smooth = np.convolve(row_mean, kernel, mode='same')
-    grad = np.abs(np.gradient(smooth))
-
-    # 只取搜索窗口内的梯度
-    grad[0:lo] = 0
-    grad[hi:] = 0
-
-    best_y = int(np.argmax(grad))
-
-    if float(grad[best_y]) < 2.0:
-        return None
-
-    return best_y
-
-
-def _split_by_gray_seam(gray: np.ndarray, h: int, w: int):
-    if gray is None or h < 20 or w < 20:
-        return None
-
-    lo, hi = int(h * 0.38), int(h * 0.78)
-    if hi <= lo:
-        return None
-
-    x1, x2 = int(w * 0.18), int(w * 0.86)
-    if x2 - x1 < max(20, w * 0.20):
-        x1, x2 = 0, w
-
-    crop = gray[:, x1:x2]
-    row_mean = np.mean(crop, axis=1).astype(float)
-    scharr_y = cv2.Scharr(crop, cv2.CV_32F, 0, 1)
-    row_edge = np.mean(np.abs(scharr_y), axis=1).astype(float)
-
-    win = max(5, h // 90)
-    if win % 2 == 0:
-        win += 1
-    kernel = np.ones(win, dtype=float) / win
-    smooth_mean = np.convolve(row_mean, kernel, mode='same')
-    smooth_edge = np.convolve(row_edge, kernel, mode='same')
-
-    mean_win = smooth_mean[lo:hi + 1]
-    edge_win = smooth_edge[lo:hi + 1]
-    if mean_win.size == 0 or edge_win.size == 0:
-        return None
-
-    dark = float(np.max(mean_win)) - smooth_mean
-    dark_win = dark[lo:hi + 1]
-    dark_norm = _norm01(dark_win)
-    edge_norm = _norm01(edge_win)
-    local_contrast = _row_local_contrast(smooth_mean, lo, hi, max(4, h // 80))
-
-    score = 0.48 * edge_norm + 0.32 * dark_norm + 0.20 * local_contrast
-    if score.size == 0:
-        return None
-
-    best_rel = int(np.argmax(score))
-    best_y = lo + best_rel
-    if float(score[best_rel]) < 0.28:
-        return None
-    if float(edge_norm[best_rel]) < 0.20 and float(dark_norm[best_rel]) < 0.35:
-        return None
-
-    return best_y
-
-
-def _norm01(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=float)
-    if values.size == 0:
-        return values
-    vmin = float(np.min(values))
-    vmax = float(np.max(values))
-    if vmax - vmin < 1e-6:
-        return np.zeros_like(values, dtype=float)
-    return (values - vmin) / (vmax - vmin)
-
-
-def _row_local_contrast(row: np.ndarray, lo: int, hi: int, radius: int) -> np.ndarray:
-    out = []
-    n = len(row)
-    for y in range(lo, hi + 1):
-        a1 = max(0, y - radius)
-        a2 = max(a1 + 1, y - max(1, radius // 3))
-        b1 = min(n - 1, y + max(1, radius // 3))
-        b2 = min(n, y + radius)
-        above = float(np.mean(row[a1:a2])) if a2 > a1 else float(row[y])
-        below = float(np.mean(row[b1:b2])) if b2 > b1 else float(row[y])
-        out.append(abs(above - below))
-    return _norm01(np.array(out, dtype=float))
 
 
 def _foreground_binary(binary: np.ndarray, gray: np.ndarray = None) -> np.ndarray:
@@ -214,32 +113,291 @@ def _foreground_binary(binary: np.ndarray, gray: np.ndarray = None) -> np.ndarra
     return fg
 
 
+def _split_from_tick_band_valley(band_info: dict):
+    valley = band_info.get('tick_band_valley') if band_info else None
+    response = band_info.get('row_projection_smooth') if band_info else None
+    if response is None or not valley:
+        return None
+
+    valley_y1, valley_y2 = int(valley[0]), int(valley[1])
+    y1 = max(0, valley_y1)
+    y2 = min(len(response), valley_y2)
+    if y2 <= y1:
+        return None
+    return y1 + int(np.argmin(response[y1:y2]))
+
+
+def _find_component_endpoint_seam(band_info: dict, full_h: int):
+    if not band_info:
+        return None, {}
+    starts = band_info.get('component_start_response')
+    ends = band_info.get('component_end_response')
+    if starts is None or ends is None:
+        return None, {}
+
+    lo = max(0, int(full_h * 0.34))
+    hi = min(full_h, int(full_h * 0.75))
+    if hi - lo < 20:
+        return None, {}
+
+    peak_distance = max(12, min(28, int(full_h * 0.025)))
+    # Consecutive scale bands can be separated by a short physical gap after
+    # rotation.  At 957 px high, the former 2.5% rule produced 23 px and
+    # rejected an observed 24 px main-end/vernier-start pair.  Keep the
+    # distance bounded so unrelated component groups remain ineligible.
+    max_gap = max(24, min(36, int(round(full_h * 0.035))))
+    end_peaks = _profile_peaks(ends, lo, hi, peak_distance)
+    start_peaks = _profile_peaks(starts, lo, hi, peak_distance)
+    if not end_peaks or not start_peaks:
+        return None, {}
+
+    end_max = max(float(ends[y]) for y in end_peaks)
+    start_max = max(float(starts[y]) for y in start_peaks)
+    best = None
+    for end_y in end_peaks:
+        for start_y in start_peaks:
+            gap = abs(start_y - end_y)
+            if gap > max_gap:
+                continue
+            end_score = float(ends[end_y]) / max(end_max, 1e-6)
+            start_score = float(starts[start_y]) / max(start_max, 1e-6)
+            score = end_score * start_score * (1.0 - 0.12 * gap / max_gap)
+            if best is None or score > best[0]:
+                best = (score, end_y, start_y)
+
+    if best is None:
+        return None, {}
+    score, end_y, start_y = best
+    if score < 0.18:
+        return None, {}
+    return int(end_y), {
+        'endpoint_score': float(score),
+        'main_end_y': int(end_y),
+        'vernier_start_y': int(start_y),
+    }
+
+
+def _profile_peaks(profile: np.ndarray, lo: int, hi: int, min_distance: int):
+    values = np.asarray(profile, dtype=float)
+    if values.size == 0 or hi <= lo:
+        return []
+    threshold = max(0.5, float(np.max(values[lo:hi])) * 0.22)
+    order = np.argsort(values[lo:hi])[::-1] + lo
+    peaks = []
+    for y in order:
+        if values[y] < threshold:
+            break
+        if any(abs(int(y) - other) < min_distance for other in peaks):
+            continue
+        peaks.append(int(y))
+    return peaks
+
+
+def _tick_bands_from_component_endpoints(band_info: dict,
+                                         split_y: int,
+                                         full_h: int,
+                                         seam_info: dict):
+    components = band_info.get('tick_components') if band_info else None
+    if components is None or len(components) == 0 or not seam_info:
+        return {}
+    main_end_y = seam_info.get('main_end_y')
+    vernier_start_y = seam_info.get('vernier_start_y')
+    if main_end_y is None or vernier_start_y is None:
+        return {}
+
+    tolerance = max(12, min(30, int(full_h * 0.022)))
+    main_components = [component for component in components
+                       if abs(int(component[1] + component[3] - 1) - main_end_y) <= tolerance]
+    vernier_components = [component for component in components
+                          if abs(int(component[1]) - vernier_start_y) <= tolerance]
+    result = {}
+    if len(main_components) >= 5:
+        result['main_tick_band'] = (
+            max(0, min(int(component[1]) for component in main_components)),
+            split_y,
+        )
+    if len(vernier_components) >= 5:
+        result['vernier_tick_band'] = (
+            split_y,
+            min(full_h, max(int(component[1] + component[3]) for component in vernier_components)),
+        )
+    return result
+
+
+def _find_tick_band_pair(row_score: np.ndarray, full_h: int):
+    values = np.asarray(row_score, dtype=float)
+    if values.size < 16:
+        return None
+    vmax = float(np.max(values))
+    positive = values[values > 0]
+    if vmax <= 0 or positive.size == 0:
+        return None
+
+    min_len = max(7, min(30, int(full_h * 0.025)))
+    threshold = max(float(np.percentile(positive, 62)), vmax * 0.18)
+    segments = _contiguous_segments_1d(values >= threshold, min_len=min_len)
+    if len(segments) < 2:
+        segments = _contiguous_segments_1d(
+            values >= vmax * 0.12, min_len=max(5, min_len // 2)
+        )
+    if len(segments) < 2:
+        return None
+
+    min_gap = max(3, int(full_h * 0.008))
+    max_gap = max(20, int(full_h * 0.22))
+    candidates = []
+    for upper, lower in zip(segments, segments[1:]):
+        gap = lower[0] - upper[1]
+        if gap < min_gap or gap > max_gap:
+            continue
+        split = (upper[1] + lower[0]) / 2.0
+        if not (full_h * 0.30 <= split <= full_h * 0.82):
+            continue
+        response = float(np.mean(values[upper[0]:upper[1]]))
+        response += float(np.mean(values[lower[0]:lower[1]]))
+        center_bias = 1.0 - min(1.0, abs(split / full_h - 0.62) / 0.40)
+        upper_mean = float(np.mean(values[upper[0]:upper[1]]))
+        lower_mean = float(np.mean(values[lower[0]:lower[1]]))
+        response_ratio = min(upper_mean, lower_mean) / max(upper_mean, lower_mean, 1e-6)
+        min_band_height = max(min_len, int(full_h * 0.04))
+        candidates.append({
+            'score': response + 0.12 * center_bias,
+            'upper': upper,
+            'lower': lower,
+            'valid': (
+                upper[1] - upper[0] >= min_band_height and
+                lower[1] - lower[0] >= min_band_height and
+                response_ratio >= 0.35
+            ),
+        })
+
+    valid_candidates = [candidate for candidate in candidates if candidate['valid']]
+    if valid_candidates:
+        best = max(valid_candidates, key=lambda item: item['score'])
+        return best['upper'], best['lower'], (best['upper'][1], best['lower'][0])
+
+    internal = _find_internal_tick_band_valley(values, segments, full_h, min_len)
+    if internal is None:
+        return None
+    return internal
+
+
+def _find_internal_tick_band_valley(values: np.ndarray,
+                                    segments: list,
+                                    full_h: int,
+                                    min_len: int):
+    if not segments:
+        return None
+
+    best = None
+    global_peak = float(np.max(values))
+    if global_peak <= 0:
+        return None
+
+    for start, end in segments:
+        segment_height = end - start
+        guard = max(12, int(segment_height * 0.15))
+        if segment_height < max(min_len * 3, guard * 2 + 3):
+            continue
+
+        local_window = max(18, min(45, segment_height // 5))
+        valley_radius = max(4, min(10, segment_height // 18))
+        search_lo = start + guard
+        search_hi = end - guard
+        for y in range(search_lo, search_hi):
+            valley_lo = max(start, y - valley_radius)
+            valley_hi = min(end, y + valley_radius + 1)
+            value = float(values[y])
+            if value > float(np.min(values[valley_lo:valley_hi])):
+                continue
+
+            left_peak = float(np.max(values[max(start, y - local_window):y]))
+            right_peak = float(np.max(values[y + 1:min(end, y + local_window + 1)]))
+            lower_peak = min(left_peak, right_peak)
+            if lower_peak < global_peak * 0.35:
+                continue
+            if value > lower_peak * 0.65:
+                continue
+
+            upper = (start, y)
+            lower = (y, end)
+            min_band_height = max(min_len, int(full_h * 0.04))
+            if upper[1] - upper[0] < min_band_height or lower[1] - lower[0] < min_band_height:
+                continue
+
+            score = lower_peak - value
+            if best is None or score > best[0]:
+                best = (score, upper, lower)
+
+    if best is None:
+        return None
+    _, upper, lower = best
+    return upper, lower, (upper[1], lower[0])
+
+
 def _analyze_horizontal_tick_bands(gray: np.ndarray,
                                    binary: np.ndarray,
-                                   split_y: int) -> dict:
+                                   split_y: int = None,
+                                   projection: dict = None) -> dict:
     h, w = gray.shape[:2]
-    fg = _foreground_binary(binary, gray)
-    if fg is None or fg.size == 0:
-        return {
-            'main_tick_band': (max(0, split_y - max(24, h // 3)), split_y),
-            'vernier_tick_band': (split_y, min(h, split_y + max(24, h // 4))),
-        }
+    if projection is None:
+        fg = _foreground_binary(binary, gray)
+        if fg is None or fg.size == 0:
+            return {}
+        kernel_h = int(round(h * config.region_split.vertical_open_height_ratio))
+        kernel_h = max(config.region_split.vertical_open_min_height,
+                       min(config.region_split.vertical_open_max_height, kernel_h))
+        if kernel_h % 2 == 0:
+            kernel_h += 1
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
+        vertical = cv2.morphologyEx(fg, cv2.MORPH_OPEN, vertical_kernel)
+        if np.count_nonzero(vertical) < max(20, fg.size * 0.0004):
+            vertical = fg
+        raw_row_score = np.mean(vertical > 0, axis=1).astype(float)
+        tick_components = _select_tick_components(vertical, kernel_h)
+        row_score = (_component_tick_support_from_components(tick_components, h)
+                     if config.region_split.projection_use_components else raw_row_score)
+        start_response, end_response = _component_endpoint_responses(tick_components, h)
+        row_coverage = _row_horizontal_coverage(vertical)
+        win = int(round(h * config.region_split.projection_smooth_height_ratio))
+        win = max(config.region_split.projection_smooth_min,
+                  min(config.region_split.projection_smooth_max, win))
+        if win % 2 == 0:
+            win += 1
+        smooth = np.convolve(row_score, np.ones(win, dtype=float) / win, mode='same')
+        coverage_smooth = np.convolve(row_coverage, np.ones(win, dtype=float) / win, mode='same')
+    else:
+        vertical = projection.get('vertical_binary')
+        row_score = projection.get('row_projection')
+        row_coverage = projection.get('row_coverage')
+        smooth = projection.get('row_projection_smooth')
+        coverage_smooth = projection.get('row_coverage_smooth')
+        if any(value is None for value in (vertical, row_score, row_coverage, smooth, coverage_smooth)):
+            return {}
 
-    kernel_h = max(7, min(31, h // 18))
-    if kernel_h % 2 == 0:
-        kernel_h += 1
-    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
-    vertical = cv2.morphologyEx(fg, cv2.MORPH_OPEN, vertical_kernel)
-    if np.count_nonzero(vertical) < max(20, fg.size * 0.0004):
-        vertical = fg
-
-    row_score = np.mean(vertical > 0, axis=1).astype(float)
-    row_coverage = _row_horizontal_coverage(vertical)
-    win = max(5, min(21, h // 45))
-    if win % 2 == 0:
-        win += 1
-    smooth = np.convolve(row_score, np.ones(win, dtype=float) / win, mode='same')
-    coverage_smooth = np.convolve(row_coverage, np.ones(win, dtype=float) / win, mode='same')
+    base = {
+        'row_projection_raw': raw_row_score if projection is None else projection.get('row_projection_raw'),
+        'row_projection': row_score,
+        'row_projection_smooth': smooth,
+        'row_coverage': row_coverage,
+        'row_coverage_smooth': coverage_smooth,
+        'vertical_binary': vertical,
+        'tick_components': tick_components if projection is None else projection.get('tick_components'),
+        'component_start_response': start_response if projection is None else projection.get('component_start_response'),
+        'component_end_response': end_response if projection is None else projection.get('component_end_response'),
+    }
+    if split_y is None:
+        pair = _find_tick_band_pair(smooth, h)
+        if pair is None:
+            return base
+        main_band, vernier_band, valley = pair
+        base.update({
+            'main_tick_band': main_band,
+            'vernier_tick_band': vernier_band,
+            'tick_band_valley': valley,
+            'candidate_split_y': int(round((valley[0] + valley[1]) / 2.0)),
+        })
+        return base
 
     main_band = _find_tick_band_from_rows(
         smooth, 0, split_y, 'main', h, coverage_smooth)
@@ -250,16 +408,82 @@ def _analyze_horizontal_tick_bands(gray: np.ndarray,
         main_band = (max(0, split_y - max(24, int(h * 0.28))), split_y)
     if vernier_band is None:
         vernier_band = (split_y, min(h, split_y + max(24, int(h * 0.22))))
+    main_band = (
+        _find_outer_tick_band_valley(smooth, main_band[0], -1, h),
+        main_band[1],
+    )
+    vernier_band = (
+        vernier_band[0],
+        _find_outer_tick_band_valley(smooth, vernier_band[1], 1, h),
+    )
 
-    return {
+    base.update({
         'main_tick_band': main_band,
         'vernier_tick_band': vernier_band,
-        'row_projection': row_score,
-        'row_projection_smooth': smooth,
-        'row_coverage': row_coverage,
-        'row_coverage_smooth': coverage_smooth,
-        'vertical_binary': vertical,
-    }
+    })
+    return base
+
+
+def _select_tick_components(vertical: np.ndarray, min_height: int) -> np.ndarray:
+    h, w = vertical.shape[:2]
+    if h <= 0 or w <= 0:
+        return np.empty((0, 5), dtype=np.int32)
+
+    count, _, stats, _ = cv2.connectedComponentsWithStats(vertical, connectivity=8)
+    if count <= 1:
+        return np.empty((0, 5), dtype=np.int32)
+
+    max_width = int(round(w * config.region_split.projection_component_max_width_ratio))
+    max_width = max(config.region_split.projection_component_max_width_min,
+                    min(config.region_split.projection_component_max_width_max, max_width))
+    max_height = max(min_height, int(round(h * config.region_split.projection_component_max_height_ratio)))
+    mask = ((stats[1:, cv2.CC_STAT_WIDTH] <= max_width) &
+            (stats[1:, cv2.CC_STAT_HEIGHT] >= min_height) &
+            (stats[1:, cv2.CC_STAT_HEIGHT] <= max_height))
+    return stats[1:][mask].astype(np.int32, copy=False)
+
+
+def _component_tick_support_from_components(components: np.ndarray, h: int) -> np.ndarray:
+    support_delta = np.zeros(h + 1, dtype=np.int32)
+    for _, y, _, component_h, _ in components:
+        y1 = max(0, int(y))
+        y2 = min(h, int(y + component_h))
+        support_delta[y1] += 1
+        support_delta[y2] -= 1
+    support = np.cumsum(support_delta[:-1]).astype(float)
+    max_support = float(np.max(support))
+    return support / max_support if max_support > 0 else support
+
+
+def _component_endpoint_responses(components: np.ndarray, h: int):
+    starts = np.zeros(h, dtype=float)
+    ends = np.zeros(h, dtype=float)
+    for _, y, _, component_h, _ in components:
+        starts[max(0, min(h - 1, int(y)))] += 1.0
+        ends[max(0, min(h - 1, int(y + component_h - 1)))] += 1.0
+    kernel = np.ones(9, dtype=float) / 9.0
+    return np.convolve(starts, kernel, mode='same'), np.convolve(ends, kernel, mode='same')
+
+
+def _find_outer_tick_band_valley(signal: np.ndarray,
+                                 boundary: int,
+                                 direction: int,
+                                 full_h: int) -> int:
+    values = np.asarray(signal, dtype=float)
+    boundary = max(0, min(len(values) - 1, int(boundary)))
+    if values.size < 3 or direction not in (-1, 1):
+        return boundary
+
+    max_distance = max(12, min(56, int(full_h * 0.15)))
+    boundary_value = float(values[boundary])
+    for distance in range(2, max_distance + 1):
+        y = boundary + direction * distance
+        if not 1 <= y < len(values) - 1:
+            break
+        if values[y] <= values[y - 1] and values[y] < values[y + 1]:
+            if float(values[y]) <= boundary_value * 0.85:
+                return y
+    return boundary
 
 
 def _row_horizontal_coverage(binary: np.ndarray) -> np.ndarray:
@@ -386,243 +610,54 @@ def _contiguous_segments_1d(mask: np.ndarray, min_len: int = 1):
     return segments
 
 
-def _split_by_candidate_scan(gray: np.ndarray, binary: np.ndarray,
-                             h: int, w: int):
-    """候选扫描：用亮度空带 + 刻线间距 + 双侧覆盖联合打分。"""
-    lo, hi = int(h * config.region_split.search_lo_ratio), int(h * config.region_split.search_hi_ratio)
-    if hi <= lo:
-        return None
-
-    band = max(h // config.region_split.density_band_ratio_denom,
-               config.region_split.density_band_min)
-    gray_means = np.mean(gray, axis=1).astype(float)
-    row_mean_min = float(np.min(gray_means[lo:hi + 1]))
-    row_mean_max = float(np.max(gray_means[lo:hi + 1]))
-    row_mean_span = max(row_mean_max - row_mean_min, 1.0)
-
-    best_y = None
-    best_score = -1.0
-    for cy in range(lo + band, hi - band):
-        y1 = max(0, cy - band // 2)
-        y2 = min(h, cy + band // 2)
-        if y2 <= y1:
-            continue
-
-        band_density = float(np.mean(binary[y1:y2, :] > 0))
-        if band_density > 0.45:
-            continue
-
-        above_zone = binary[max(0, cy - band):cy, :]
-        below_zone = binary[cy:min(h, cy + band), :]
-        above_cov, above_gap = _equispaced_coverage(above_zone, w)
-        below_cov, below_gap = _equispaced_coverage(below_zone, w)
-        if above_cov < 0.22 or below_cov < 0.22:
-            continue
-        if above_gap <= 0 or below_gap <= 0:
-            continue
-
-        ratio = above_gap / below_gap if above_gap > below_gap else below_gap / above_gap
-        if ratio < 1.15 or ratio > 4.5:
-            continue
-        ratio_score = max(0.0, 1.0 - abs(ratio - 2.0) / 1.5)
-        cover_score = min(1.0, above_cov * below_cov * 1.5)
-        gap_score = 1.0 - band_density
-        bright_score = (gray_means[cy] - row_mean_min) / row_mean_span
-        score = 0.42 * ratio_score + 0.28 * cover_score + 0.22 * gap_score + 0.08 * bright_score
-
-        if score > best_score:
-            best_score = score
-            best_y = cy
-
-    if best_y is None or best_score < 0.35:
-        return None
-
-    return _snap_to_brightest_gap(gray, best_y, band, lo, hi)
-
-
-def _snap_to_brightest_gap(gray: np.ndarray, center_y: int, band: int,
-                           lo: int, hi: int) -> int:
-    """在 center_y 附近吸附到最亮的空带行。"""
-    half = max(4, band // 2)
-    win_lo = max(lo, center_y - half)
-    win_hi = min(hi, center_y + half)
-    if win_hi <= win_lo:
-        return center_y
-    row_means = np.mean(gray[win_lo:win_hi + 1, :], axis=1)
-    return win_lo + int(np.argmax(row_means))
-
-
-def _equispaced_coverage(zone_binary: np.ndarray, w: int):
-    """
-    估算一个 y 带内的"等间距连续刻线段跨度 / ROI 宽度" + 估算的 tick_gap。
-
-    Returns:
-        (coverage_ratio, tick_gap_px)
-        coverage_ratio: 0~1，最长等间距段跨度 / ROI 宽度
-        tick_gap_px:    该段刻线相邻间距中位值（无信号时返回 0）
-    """
-    if zone_binary is None or zone_binary.size == 0:
-        return 0.0, 0.0
-    vproj = np.sum(zone_binary, axis=0).astype(float)
-    vmax = float(np.max(vproj))
-    if vmax <= 0:
-        return 0.0, 0.0
-    vproj_norm = vproj / vmax
-
-    from .utils import find_peaks_adaptive
-    peaks = find_peaks_adaptive(vproj_norm, min_dist=3, threshold_factor=0.3)
-    if len(peaks) < 5:
-        return 0.0, 0.0
-
-    strength = vproj_norm[peaks]
-    th = max(0.15, float(np.percentile(strength, 30)))
-    strong = peaks[strength >= th]
-    if len(strong) < 5:
-        strong = peaks
-
-    diffs = np.diff(strong)
-    if len(diffs) == 0:
-        return 0.0, 0.0
-    tick_gap = float(np.median(diffs))
-    if tick_gap < 3.0:
-        return 0.0, 0.0
-
-    lo_g, hi_g = tick_gap * 0.5, tick_gap * 1.8
-    max_irr = 2
-    segments = []
-    cur_start = 0
-    irr_run = 0
-    for i, d in enumerate(diffs):
-        if lo_g <= d <= hi_g:
-            irr_run = 0
-        else:
-            irr_run += 1
-            if irr_run > max_irr:
-                end_idx = i - irr_run
-                if end_idx - cur_start >= 3:
-                    segments.append((cur_start, end_idx))
-                cur_start = i + 1
-                irr_run = 0
-    if len(strong) - 1 - cur_start >= 3:
-        segments.append((cur_start, len(strong) - 1))
-
-    if not segments:
-        return 0.0, 0.0
-
-    best = max(segments, key=lambda s: s[1] - s[0])
-    span = int(strong[best[1]]) - int(strong[best[0]])
-    # 重新估算该最长段内部的 tick_gap（更精确）
-    seg_diffs = np.diff(strong[best[0]:best[1] + 1])
-    seg_diffs_valid = seg_diffs[(seg_diffs >= lo_g) & (seg_diffs <= hi_g)]
-    if len(seg_diffs_valid) >= 2:
-        tick_gap = float(np.median(seg_diffs_valid))
-    return min(1.0, span / float(w)), tick_gap
-
-
-# ═══════════════════════════════════════════════════════════
-#  可视化
-# ═══════════════════════════════════════════════════════════
-
-def _make_split_vis(color_bg: np.ndarray,   # BGR 彩色图（若不可用则为灰度）
-                     gray: np.ndarray,
-                     binary: np.ndarray,
-                     split_y: int,
-                     band_info: dict = None) -> np.ndarray:
-    """生成区域分离的可视化图：彩色原图+分割线 + 梯度投影图 + 闭运算投影图"""
+def _make_split_vis(color_bg: np.ndarray,
+                    gray: np.ndarray,
+                    binary: np.ndarray,
+                    split_y: int,
+                    band_info: dict = None) -> np.ndarray:
+    """Draw the scale and its aligned horizontal projection side by side."""
     h, w = gray.shape
-
-    # ── 上：用彩色背景（清晰可辨）或灰度背景 + 分割线 ──
-    if len(color_bg.shape) == 3 and color_bg.shape[2] == 3:
-        vis_gray = color_bg.copy()
+    scale_vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    foreground = band_info.get('vertical_binary') if band_info else None
+    if foreground is None:
+        foreground = _foreground_binary(binary, gray)
+    hproj = band_info.get('row_projection_smooth') if band_info else None
+    if hproj is None:
+        hproj = np.sum(foreground > 0, axis=1).astype(float)
     else:
-        vis_gray = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        hproj = np.asarray(hproj, dtype=float).copy()
+    if hproj.size and np.max(hproj) > 0:
+        hproj /= np.max(hproj)
 
-    if band_info:
-        overlay = vis_gray.copy()
-        main_band = band_info.get('main_tick_band')
-        vernier_band = band_info.get('vernier_tick_band')
-        if main_band:
-            cv2.rectangle(overlay, (0, int(main_band[0])), (w - 1, int(main_band[1])),
-                          (0, 180, 80), -1)
-        if vernier_band:
-            cv2.rectangle(overlay, (0, int(vernier_band[0])), (w - 1, int(vernier_band[1])),
-                          (255, 160, 40), -1)
-        vis_gray = cv2.addWeighted(vis_gray, 0.82, overlay, 0.18, 0)
-        if main_band:
-            cv2.line(vis_gray, (0, int(main_band[0])), (w, int(main_band[0])), (0, 180, 80), 1)
-            cv2.line(vis_gray, (0, int(main_band[1])), (w, int(main_band[1])), (0, 180, 80), 1)
-        if vernier_band:
-            cv2.line(vis_gray, (0, int(vernier_band[0])), (w, int(vernier_band[0])), (255, 160, 40), 1)
-            cv2.line(vis_gray, (0, int(vernier_band[1])), (w, int(vernier_band[1])), (255, 160, 40), 1)
+    projection_w = max(160, min(360, w // 5))
+    projection = np.full((h, projection_w, 3), 245, dtype=np.uint8)
+    for y, value in enumerate(hproj):
+        x_end = int(round(float(value) * (projection_w - 1)))
+        if x_end > 0:
+            cv2.line(projection, (0, y), (x_end, y), (20, 20, 20), 1)
 
-    cv2.line(vis_gray, (0, split_y), (w, split_y), (0, 255, 255), 2)
-    cv2.putText(vis_gray, "MAIN SCALE", (10, split_y - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-    cv2.putText(vis_gray, "VERNIER", (10, split_y + 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+    main_band = band_info.get('main_tick_band') if band_info else None
+    vernier_band = band_info.get('vernier_tick_band') if band_info else None
+    for band, color in ((main_band, (0, 180, 80)), (vernier_band, (255, 160, 40))):
+        if not band:
+            continue
+        y1 = max(0, min(h - 1, int(band[0])))
+        y2 = max(0, min(h - 1, int(band[1])))
+        overlay = scale_vis.copy()
+        cv2.rectangle(overlay, (0, y1), (w - 1, y2), color, -1)
+        scale_vis = cv2.addWeighted(overlay, 0.16, scale_vis, 0.84, 0)
+        cv2.line(scale_vis, (0, y1), (w - 1, y1), color, 1, cv2.LINE_AA)
+        cv2.line(scale_vis, (0, y2), (w - 1, y2), color, 1, cv2.LINE_AA)
+        cv2.line(projection, (0, y1), (projection_w - 1, y1), color, 1, cv2.LINE_AA)
+        cv2.line(projection, (0, y2), (projection_w - 1, y2), color, 1, cv2.LINE_AA)
 
-    # ── 中：梯度投影图 ──
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    sobel_y = cv2.Sobel(enhanced, cv2.CV_64F, 0, 1, ksize=3)
-    abs_grad = np.abs(sobel_y)
-    grad_proj = np.sum(abs_grad, axis=1).astype(float)
-    if np.max(grad_proj) > 0:
-        grad_proj /= np.max(grad_proj)
-    grad_plot = draw_projection_plot(grad_proj, title="Sobel-Y Gradient Projection (peak = split)")
-    if len(grad_proj) > 0:
-        px = int(split_y * (grad_plot.shape[1] - 40) / len(grad_proj)) + 20
-        cv2.line(grad_plot, (px, 0), (px, grad_plot.shape[0]),
-                 (0, 255, 255), 1, cv2.LINE_AA)
+    split_y = max(0, min(h - 1, int(split_y)))
+    seam_color = (40, 40, 240)
+    cv2.line(scale_vis, (0, split_y), (w - 1, split_y), seam_color, 2, cv2.LINE_AA)
+    cv2.line(projection, (0, split_y), (projection_w - 1, split_y), seam_color, 2, cv2.LINE_AA)
 
-    # ── 下：二值图闭运算投影 ──
-    if binary is not None:
-        closed = band_info.get('vertical_binary') if band_info else None
-        if closed is None:
-            fg = _foreground_binary(binary, gray)
-            kernel_h = max(7, min(31, h // 18))
-            if kernel_h % 2 == 0:
-                kernel_h += 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
-            closed = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel)
-        hproj = np.sum(closed > 0, axis=1).astype(float)
-        if np.max(hproj) > 0:
-            hproj /= np.max(hproj)
-        bin_plot = draw_projection_plot(hproj,
-                                         title="Horizontal Projection of Vertical Tick Pixels")
-        if len(hproj) > 0:
-            px2 = int(split_y * (bin_plot.shape[1] - 40) / len(hproj)) + 20
-            cv2.line(bin_plot, (px2, 0), (px2, bin_plot.shape[0]),
-                     (0, 255, 255), 1, cv2.LINE_AA)
-
-        # 闭运算效果预览（缩略图）
-        closed_thumb = cv2.resize(closed, (min(w, 600), min(h, 80)),
-                                   interpolation=cv2.INTER_AREA)
-        closed_vis = cv2.cvtColor(closed_thumb, cv2.COLOR_GRAY2BGR)
-    else:
-        bin_plot = np.zeros((200, 200, 3), dtype=np.uint8)
-        closed_vis = np.zeros((80, 200, 3), dtype=np.uint8)
-
-    # ── 合并 ──
-    gap = 4
-    plot_h = grad_plot.shape[0]
-    plot_h2 = bin_plot.shape[0]
-    thumb_h = closed_vis.shape[0]
-
-    out_h = h + plot_h + plot_h2 + thumb_h + gap * 4
-    out_w = max(w, grad_plot.shape[1], bin_plot.shape[1])
-    vis = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-    vis[:] = (30, 30, 35)
-
-    vis[:h, :w] = vis_gray
-    y = h + gap
-    vis[y:y + plot_h, :grad_plot.shape[1]] = grad_plot
-    y += plot_h + gap
-    vis[y:y + thumb_h, :closed_vis.shape[1]] = closed_vis
-    y += thumb_h + gap
-    vis[y:y + plot_h2, :bin_plot.shape[1]] = bin_plot
-
-    cv2.putText(vis, "STEP 2: Region Split (projection + gradient + binary)",
-                (5, out_h - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 125), 1)
-
+    gap = 8
+    vis = np.full((h, w + gap + projection_w, 3), 30, dtype=np.uint8)
+    vis[:, :w] = scale_vis
+    vis[:, w + gap:] = projection
     return vis

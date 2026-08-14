@@ -14,7 +14,7 @@ from .preprocess import preprocess
 from .region_split import split_scales
 from .result import CaliperResult
 from .roi_extract import locate_roi_lowres, orient_caliper
-from .utils import draw_legend_below, draw_projection_plot
+from .utils import draw_legend_below
 from .vernier_scale import recognize_vernier_scale
 
 
@@ -64,12 +64,6 @@ class CaliperPipeline:
         roi_result = locate_roi_lowres(img)
         self._record_timing('roi_lowres', 'ROI 定位', t0)
         roi_timing_labels = {
-            'template_resize_gray': 'ROI: 模板缩放/灰度化',
-            'template_match': 'ROI: 螺丝模板匹配',
-            'template_geometry': 'ROI: 螺丝几何组合',
-            'template_match_fallback': 'ROI: 多尺度模板匹配',
-            'template_geometry_fallback': 'ROI: 多尺度几何组合',
-            'template_map_and_crop': 'ROI: 模板映射裁剪',
             'roi_debug_vis': 'ROI: 定位可视化',
             'gray_full': 'ROI: 原图转灰度',
             'resize_gray_linear': 'ROI: 灰度缩放',
@@ -91,14 +85,68 @@ class CaliperPipeline:
                 'ms': float(ms),
             }
         self.step_results['timings'] = self.timings
+        initial = self._run_from_roi_result(original, roi_result, progress_callback)
+        vernier = self.step_results.get('vernier', {})
+        candidates = roi_result.get('roi_recovery_candidates', [])
+        if (vernier.get('error') != 'no_reliable_valley_bounded_tick_range'
+                or not candidates):
+            return initial
+
+        initial_state = (self.debug_images, self.step_results, self.timings)
+        attempts = []
+        for candidate in candidates:
+            self.debug_images = {}
+            self.step_results = {}
+            self.timings = {}
+            self._pipeline_t0 = time.perf_counter()
+            recovered_roi = self._roi_result_for_recovery_candidate(
+                original, roi_result, candidate
+            )
+            recovered = self._run_from_roi_result(
+                original, recovered_roi, progress_callback
+            )
+            recovered_vernier = self.step_results.get('vernier', {})
+            attempts.append({
+                'name': candidate['name'],
+                'added_area': candidate['added_area'],
+                'vernier_error': recovered_vernier.get('error'),
+                'vernier_tick_count': len(recovered_vernier.get('vernier_ticks', [])),
+                'zero_x': recovered_vernier.get('zero_x'),
+            })
+            if self._vernier_result_is_reliable(recovered_vernier):
+                recovered.extra_info['roi_recovery'] = {
+                    'triggered': True,
+                    'selected_candidate': candidate['name'],
+                    'attempts': attempts,
+                }
+                self.step_results['roi']['roi_recovery'] = recovered.extra_info['roi_recovery']
+                return recovered
+
+        self.debug_images, self.step_results, self.timings = initial_state
+        initial.extra_info['roi_recovery'] = {
+            'triggered': True,
+            'selected_candidate': None,
+            'attempts': attempts,
+        }
+        return initial
+
+    def _run_from_roi_result(self, original: np.ndarray,
+                             roi_result: dict,
+                             progress_callback=None) -> CaliperResult:
         if roi_result['roi_color'] is None:
             self._record_timing('total', '总耗时', self._pipeline_t0)
             return self._fail(original, 'ROI 提取失败')
 
+        roi_source = str(roi_result.get('roi_source') or '')
         roi_source_label = {
-            'screw_template': '螺丝模板匹配',
-            'lowres_projection': '低分辨率投影',
-        }.get(roi_result.get('roi_source'), 'ROI 定位')
+            'lowres_projection': '低分辨率投影框',
+            'lowres_body': '低分辨率主体框',
+            'lowres_compact': '低分辨率紧凑框',
+        }.get(roi_source)
+        if roi_source.startswith('lowres_compact_recovery_'):
+            roi_source_label = '低分辨率紧凑框局部扩边恢复'
+        if roi_source_label is None:
+            roi_source_label = 'ROI 定位'
         if roi_result.get('lowres_debug') is not None:
             self.debug_images['1_ROI定位'] = roi_result.get('lowres_debug')
         self._emit_progress(progress_callback, '1_ROI定位', f'ROI 定位完成：{roi_source_label}')
@@ -146,6 +194,40 @@ class CaliperPipeline:
         self._emit_progress(progress_callback, '1b_方向校正', '方向校正完成')
         return self._run_remainder(original, orient_result, progress_callback)
 
+    @staticmethod
+    def _roi_result_for_recovery_candidate(original: np.ndarray,
+                                           base_roi: dict,
+                                           candidate: dict) -> dict:
+        x1, y1, x2, y2 = candidate['roi_box_original']
+        recovery = dict(base_roi)
+        recovery['roi_color'] = original[y1:y2, x1:x2].copy()
+        recovery['x_offset'] = x1
+        recovery['y_offset'] = y1
+        recovery['roi_box_original'] = (x1, y1, x2, y2)
+        recovery['roi_source'] = 'lowres_compact_recovery_' + candidate['name']
+        recovery['lowres_debug'] = None
+        recovery['roi_selection'] = {
+            **base_roi.get('roi_selection', {}),
+            'recovery_candidate': candidate,
+        }
+        recovery['roi_recovery_candidates'] = []
+        return recovery
+
+    @staticmethod
+    def _vernier_result_is_reliable(vernier_result: dict) -> bool:
+        # A short, partial run can be internally periodic but cannot establish
+        # the full vernier range. This gates recovery acceptance only; it does
+        # not create, complete, or require an exact number of ticks.
+        min_observed = max(
+            config.vernier_scale.min_tick_count,
+            config.vernier_scale.recovery_min_observed_tick_count,
+        )
+        return (
+            not vernier_result.get('error')
+            and len(vernier_result.get('vernier_ticks', [])) >= min_observed
+            and float(vernier_result.get('zero_x', 0.0)) > 0.0
+        )
+
     def _run_remainder(self, original: np.ndarray,
                        orient_result: dict,
                        progress_callback=None) -> CaliperResult:
@@ -185,18 +267,6 @@ class CaliperPipeline:
         self._record_timing('vernier_scale', '游标刻线识别与对齐', t0)
 
         if not self.fast_mode:
-            t0 = self._start_timing()
-            overview = _make_zero_overview(
-                rotated_color,
-                main_result,
-                vernier_result,
-                split_y,
-                region_main,
-                region_vernier,
-            )
-            self._record_timing('zero_overview_vis', '零线总览图', t0)
-            self.debug_images['3c_零线总览'] = overview
-            self._emit_progress(progress_callback, '3c_零线总览', '零线总览完成')
             if vernier_result.get('vis_ticks') is not None:
                 self.debug_images['4b_游标刻度线'] = vernier_result['vis_ticks']
                 self._emit_progress(progress_callback, '4b_游标刻度线', '游标刻线识别完成')
@@ -238,7 +308,6 @@ class CaliperPipeline:
             'roi_box_original': roi_info.get('roi_box_original'),
             'fast_mode': bool(self.fast_mode),
             'speed_strategies': {
-                'roi_template_matching': roi_info.get('roi_source') == 'screw_template',
                 'reuse_region_binary': True,
                 'simple_final_annotation': bool(self.fast_mode),
                 'seam_near_main_refine': True,
@@ -305,6 +374,7 @@ def _regenerate_alignment_vis(vernier_result: dict,
         vernier_result['zero_x'],
         vernier_result.get('aligned_tick'),
         vernier_result.get('alignment_confidence', 0.0),
+        alignment_ambiguity=vernier_result.get('alignment_ambiguity'),
         full_color=rotated_color,
         split_y=split_y,
         main_ticks=main_ticks,
@@ -350,11 +420,18 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
     if H_main < 10 or W_main < 10:
         return None
 
+    extra = final_result.extra_info if final_result else {}
+    main_deriv = extra.get('main_derivation', {}) if hasattr(final_result, 'extra_info') else {}
+    vertical_expand_gaps = (
+        float(main_deriv.get('ocr_vertical_expand_gaps', 0.0))
+        if isinstance(main_deriv, dict) else 0.0
+    )
     binary_crop, x_off, y_off = find_nearest_cm_digit_region(
         main_ticks,
         main_gap,
         zero_x,
         main_binary,
+        vertical_expand_gaps=vertical_expand_gaps,
     )
     if binary_crop is None or binary_crop.size == 0:
         fallback = main_color.copy()
@@ -371,8 +448,6 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
         return fallback
 
     ch, cw = binary_crop.shape
-    extra = final_result.extra_info if final_result else {}
-    main_deriv = extra.get('main_derivation', {}) if hasattr(final_result, 'extra_info') else {}
     strategy = main_deriv.get('strategy', '?') if isinstance(main_deriv, dict) else '?'
     eng = main_deriv.get('ocr_engine', '?') if isinstance(main_deriv, dict) else '?'
     ocr_candidates = main_deriv.get('ocr_candidates', []) if isinstance(main_deriv, dict) else []
@@ -391,6 +466,8 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
     else:
         ocr_line = "OCR => no candidate"
         ocr_color = (100, 100, 255)
+    if isinstance(main_deriv, dict) and main_deriv.get('ocr_expanded_retry_used'):
+        ocr_line += " [expanded retry]"
 
     panel_a = main_color.copy()
     for t in main_ticks:
@@ -414,7 +491,7 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
     cv2.rectangle(panel_a, (x_off, y_off), (x_off + cw, y_off + ch), (0, 0, 255), 2)
     cv2.putText(
         panel_a,
-        f"backup ({cw}x{ch})",
+        f"backup ({cw}x{ch}) expand={vertical_expand_gaps:.1f}g",
         (x_off + 3, y_off + 14),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.35,
@@ -506,104 +583,6 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
     combined = draw_legend_below(combined, legend_items)
     cv2.putText(combined, f"STEP 3b: Main Scale OCR [{eng}]  strategy={strategy}",
                 (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    return combined
-
-
-def _make_zero_overview(rotated_color: np.ndarray,
-                        main_result: dict,
-                        vernier_result: dict,
-                        split_y: int,
-                        region_main: dict,
-                        region_vernier: dict) -> np.ndarray:
-    H, W = rotated_color.shape[:2]
-    overview = rotated_color.copy()
-
-    cv2.line(overview, (0, split_y), (W, split_y), (255, 255, 255), 1)
-    cv2.putText(overview, "MAIN", (4, split_y - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 100), 1)
-    cv2.putText(overview, "VERNIER", (4, split_y + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 220, 255), 1)
-
-    for t in main_result.get('main_ticks', []):
-        y_off = region_main.get('y_offset', 0)
-        color = (0, 255, 80) if t.get('is_long', False) else (0, 180, 60)
-        thickness = 4 if t.get('is_long', False) else 3
-        cv2.line(overview, (t['x'], t['y_start'] + y_off),
-                 (t['x'], min(t['y_end'] + y_off, split_y)), color, thickness)
-
-    vy_off = region_vernier.get('y_offset', split_y)
-    for t in vernier_result.get('vernier_ticks', []):
-        color = (255, 200, 50) if t.get('is_long', False) else (200, 150, 40)
-        thickness = 3 if t.get('is_long', False) else 2
-        cv2.line(overview, (t['x'], t['y_start'] + vy_off),
-                 (t['x'], t['y_end'] + vy_off), color, thickness)
-
-    zero_x = int(vernier_result.get('zero_x', 0))
-    cv2.line(overview, (zero_x, 0), (zero_x, H - 1), (255, 60, 60), 4)
-    cv2.putText(overview, f"ZERO LINE (x={zero_x})", (zero_x + 6, 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 60, 60), 2)
-    cv2.putText(overview, f"x={zero_x}", (zero_x + 6, H - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 60, 60), 2)
-
-    legend_items = [
-        ("thick red = zero line (vernier 0)", (255, 60, 60), 'line'),
-        ("green line = main scale tick", (0, 180, 60), 'line'),
-        ("orange line = vernier tick", (200, 150, 40), 'line'),
-        ("white dash = main/vernier split", (255, 255, 255), 'line'),
-    ]
-
-    zero_digit_found = vernier_result.get('zero_digit_found', False)
-    vproj_norm = vernier_result.get('vproj_norm')
-    vernier_peaks = vernier_result.get('vernier_peaks')
-
-    bar_h = 28
-    status_bar = np.zeros((bar_h, W, 3), dtype=np.uint8)
-    if zero_digit_found:
-        status_bar[:] = (40, 70, 40)
-        status_text = "[OK] Zero Digit '0' Verified by OCR"
-        status_color = (0, 255, 100)
-    else:
-        status_bar[:] = (60, 50, 30)
-        status_text = "[WARN] Zero Digit '0' NOT Found - using position fallback"
-        status_color = (100, 180, 255)
-    cv2.putText(status_bar, status_text, (8, bar_h - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1)
-
-    proj_panel = None
-    if vproj_norm is not None and vernier_peaks is not None and len(vernier_peaks) > 0:
-        proj_panel = draw_projection_plot(
-            vproj_norm,
-            vernier_peaks,
-            width=W,
-            title="Vernier Vertical Projection (for zero-line detection)",
-        )
-        if zero_x > 0 and proj_panel is not None:
-            zx_proj = int(zero_x)
-            ph = proj_panel.shape[0]
-            if 0 <= zx_proj < W:
-                cv2.line(proj_panel, (zx_proj, 0), (zx_proj, ph - 1),
-                         (50, 150, 255), 1, cv2.LINE_AA)
-                cv2.putText(proj_panel, "ZERO", (zx_proj + 3, ph - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (50, 150, 255), 1)
-
-    gap = 2
-    total_h = H + gap + bar_h
-    if proj_panel is not None:
-        total_h += gap + proj_panel.shape[0]
-    combined = np.zeros((total_h, W, 3), dtype=np.uint8)
-    combined[:] = (30, 30, 35)
-    y_cursor = 0
-    combined[y_cursor:y_cursor + H, :] = overview
-    y_cursor += H + gap
-    combined[y_cursor:y_cursor + bar_h, :] = status_bar
-    y_cursor += bar_h + gap
-    if proj_panel is not None:
-        ph = proj_panel.shape[0]
-        combined[y_cursor:y_cursor + ph, :] = proj_panel
-
-    combined = draw_legend_below(combined, legend_items)
-    cv2.putText(combined, "Step 3c: Zero Line Overview (full ROI)", (5, 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
     return combined
 
 

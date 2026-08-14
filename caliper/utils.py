@@ -47,135 +47,6 @@ def find_peaks_adaptive(signal: np.ndarray, min_dist: int = 3,
     return np.array(peaks, dtype=int)
 
 
-def detect_tick_xs_in_band(binary: np.ndarray,
-                           band_y1: int,
-                           band_y2: int,
-                           x1: int = 0,
-                           x2: int = None,
-                           min_dist: int = 3,
-                           threshold_factor: float = 0.3,
-                           dedupe_tol: float = 3.0) -> dict:
-    h, w = binary.shape[:2]
-    if x2 is None:
-        x2 = w
-    band_y1 = max(0, min(h - 1, int(band_y1)))
-    band_y2 = max(band_y1 + 1, min(h, int(band_y2)))
-    x1 = max(0, min(w - 1, int(x1)))
-    x2 = max(x1 + 1, min(w, int(x2)))
-
-    band = binary[band_y1:band_y2, x1:x2]
-    proj = np.sum(band > 0, axis=0).astype(float)
-    if proj.size == 0 or float(np.max(proj)) <= 0:
-        return {
-            'band': band,
-            'proj': proj,
-            'proj_norm': proj,
-            'smooth': proj,
-            'tick_xs_local': [],
-            'tick_xs_global': [],
-            'peaks': np.array([], dtype=int),
-            'threshold': 0.0,
-        }
-
-    proj_norm = proj / float(np.max(proj))
-    win = max(3, min(11, len(proj_norm) // 90))
-    if win % 2 == 0:
-        win += 1
-    smooth = np.convolve(proj_norm, np.ones(win, dtype=float) / win, mode='same')
-    peaks = find_peaks_adaptive(smooth, min_dist=min_dist,
-                                threshold_factor=threshold_factor)
-
-    mu = float(np.mean(smooth))
-    sigma = float(np.std(smooth))
-    threshold = max(0.04, mu + threshold_factor * sigma)
-    if len(peaks) > 0:
-        peak_threshold = max(0.04, float(np.percentile(smooth[peaks], 35)))
-        threshold = min(threshold, peak_threshold)
-
-    xs = _tick_xs_from_projection_segments(proj_norm, smooth, threshold, dedupe_tol)
-    peak_xs = [int(x) for x in peaks if smooth[int(x)] >= threshold]
-    if len(xs) < len(peak_xs):
-        xs = _dedupe_tick_xs_for_projection(xs + peak_xs, dedupe_tol)
-
-    return {
-        'band': band,
-        'proj': proj,
-        'proj_norm': proj_norm,
-        'smooth': smooth,
-        'tick_xs_local': xs,
-        'tick_xs_global': [x1 + int(x) for x in xs],
-        'peaks': peaks,
-        'threshold': threshold,
-        'band_y1': band_y1,
-        'band_y2': band_y2,
-        'x1': x1,
-        'x2': x2,
-    }
-
-
-def _tick_xs_from_projection_segments(proj_norm: np.ndarray,
-                                      smooth: np.ndarray,
-                                      threshold: float,
-                                      dedupe_tol: float) -> List[int]:
-    mask = smooth >= threshold
-    segments = []
-    start = None
-    for i, value in enumerate(mask.astype(bool)):
-        if value and start is None:
-            start = i
-        elif not value and start is not None:
-            segments.append((start, i))
-            start = None
-    if start is not None:
-        segments.append((start, len(mask)))
-
-    xs = []
-    for s, e in segments:
-        raw = proj_norm[s:e]
-        if raw.size == 0 or float(np.max(raw)) <= 0:
-            continue
-        raw_threshold = max(0.12, float(np.max(raw)) * 0.42)
-        raw_mask = raw >= raw_threshold
-        raw_segments = []
-        rs = None
-        for idx, value in enumerate(raw_mask.astype(bool)):
-            if value and rs is None:
-                rs = idx
-            elif not value and rs is not None:
-                raw_segments.append((rs, idx))
-                rs = None
-        if rs is not None:
-            raw_segments.append((rs, len(raw_mask)))
-        if not raw_segments:
-            raw_segments = [(0, len(raw))]
-
-        for rs, re in raw_segments:
-            local = raw[rs:re]
-            if local.size == 0:
-                continue
-            local_x = np.arange(rs, re, dtype=float)
-            total = float(np.sum(local))
-            if total > 1e-6:
-                x = s + int(round(float(np.sum(local_x * local) / total)))
-            else:
-                x = s + int(round((rs + re - 1) / 2.0))
-            xs.append(x)
-
-    return _dedupe_tick_xs_for_projection(xs, dedupe_tol)
-
-
-def _dedupe_tick_xs_for_projection(xs: List[int], tol: float) -> List[int]:
-    if not xs:
-        return []
-    groups = []
-    for x in sorted(int(v) for v in xs):
-        if not groups or x - groups[-1][-1] > tol:
-            groups.append([x])
-        else:
-            groups[-1].append(x)
-    return [int(round(float(np.median(group)))) for group in groups]
-
-
 def _tick_row_threshold(col: np.ndarray,
                         max_factor: float = 0.40,
                         single_stroke_cap: float = 0.80) -> float:
@@ -190,7 +61,11 @@ def _tick_row_threshold(col: np.ndarray,
 def extract_ticks_from_binary(binary: np.ndarray,
                                approx_xs: np.ndarray,
                                min_length_ratio: float = 0.25,
-                               long_tick_factor: float = None) -> List[dict]:
+                               long_tick_factor: float = None,
+                               recover_short_ticks: bool = False,
+                               short_tick_min_contiguous_ratio: float = 0.60,
+                               short_tick_min_foreground_factor: float = 2.00,
+                               short_tick_period_tolerance: float = 0.30) -> List[dict]:
     """在指定 x 坐标附近精确提取刻线起止点。
 
     v6: 加入"刻线长度 ≥ 区域高度 × min_length_ratio"硬约束，
@@ -202,11 +77,24 @@ def extract_ticks_from_binary(binary: np.ndarray,
     if long_tick_factor is None:
         long_tick_factor = config.main_scale.long_tick_factor
     ticks = []
+    coarse_xs = sorted({int(x) for x in approx_xs if 3 <= int(x) < w - 3})
+    coarse_period = 0.0
+    if len(coarse_xs) >= 3:
+        diffs = np.diff(coarse_xs)
+        positive = diffs[diffs > 1]
+        if positive.size:
+            coarse_period = float(np.median(positive))
 
-    for px in approx_xs:
-        x = int(px)
-        if x < 3 or x >= w - 3:
-            continue
+    def has_periodic_neighbors(index: int) -> bool:
+        if coarse_period <= 0 or index <= 0 or index >= len(coarse_xs) - 1:
+            return False
+        left_gap = coarse_xs[index] - coarse_xs[index - 1]
+        right_gap = coarse_xs[index + 1] - coarse_xs[index]
+        tolerance = coarse_period * short_tick_period_tolerance
+        return (abs(left_gap - coarse_period) <= tolerance and
+                abs(right_gap - coarse_period) <= tolerance)
+
+    for coarse_index, x in enumerate(coarse_xs):
 
         # 取 x 附近的列（±3像素），求和得到该位置的垂直投影
         strip = binary[:, max(0, x - 3):min(w, x + 4)]
@@ -216,16 +104,20 @@ def extract_ticks_from_binary(binary: np.ndarray,
         threshold = _tick_row_threshold(col)
         indices = np.where(col > threshold)[0]
 
-        if len(indices) < min_len_px // 2:
-            continue
-
         segs = contiguous_segments(indices, min_len=5)
         if not segs:
             continue
 
         ys, ye = max(segs, key=lambda s: s[1] - s[0])
         length = ye - ys
-        if length < min_len_px:
+        is_recovered_short = (
+            recover_short_ticks and
+            length < min_len_px and
+            length >= int(np.ceil(min_len_px * short_tick_min_contiguous_ratio)) and
+            len(indices) >= int(np.ceil(min_len_px * short_tick_min_foreground_factor)) and
+            has_periodic_neighbors(coarse_index)
+        )
+        if length < min_len_px and not is_recovered_short:
             continue
 
         x_refined = _refine_tick_x(binary, x, ys, ye,
@@ -236,6 +128,7 @@ def extract_ticks_from_binary(binary: np.ndarray,
             'y_end': int(ye),
             'y_mid': int((ys + ye) / 2),
             'length': int(length),
+            'is_recovered_short': bool(is_recovered_short),
         })
 
     if ticks:
@@ -246,100 +139,39 @@ def extract_ticks_from_binary(binary: np.ndarray,
     return ticks
 
 
-def extract_ticks_from_anchor_band(binary: np.ndarray,
-                                   direction: str,
-                                   min_length_ratio: float = 0.20,
-                                   band_ratio: float = 0.35,
-                                   peak_min_dist: int = 3,
-                                   peak_threshold_factor: float = 0.15,
-                                   long_tick_factor: float = None) -> List[dict]:
-    """Detect vertical tick marks from the band next to the split line.
+def dedupe_ticks_by_relative_gap(ticks: List[dict],
+                                 gap_ratio: float = 0.45) -> List[dict]:
+    if len(ticks) < 3:
+        return sorted(ticks, key=lambda item: item['x'])
 
-    direction="up"   finds main-scale ticks growing upward from the split.
-    direction="down" finds vernier ticks growing downward from the split.
-    """
-    h, w = binary.shape[:2]
-    if h == 0 or w == 0:
-        return []
+    ordered = sorted(ticks, key=lambda item: float(item['x']))
+    xs = np.asarray([float(item['x']) for item in ordered], dtype=float)
+    diffs = np.diff(xs)
+    positive = diffs[diffs > 0]
+    if positive.size == 0:
+        return [max(ordered, key=_tick_quality)]
 
-    band_h = max(12, min(h, int(h * band_ratio)))
-    if direction == "up":
-        anchor_band = binary[h - band_h:h, :]
-        anchor_limit = h - max(6, int(h * 0.08))
-    else:
-        anchor_band = binary[:band_h, :]
-        anchor_limit = max(6, int(h * 0.08))
+    tolerance = max(3.0, float(np.median(positive)) * float(gap_ratio))
+    groups = []
+    current = [ordered[0]]
+    group_start = float(ordered[0]['x'])
+    for tick in ordered[1:]:
+        if float(tick['x']) - group_start <= tolerance:
+            current.append(tick)
+        else:
+            groups.append(current)
+            current = [tick]
+            group_start = float(tick['x'])
+    groups.append(current)
+    return [max(group, key=_tick_quality) for group in groups]
 
-    vproj = np.sum(anchor_band > 0, axis=0).astype(float)
-    if np.max(vproj) <= 0:
-        return []
-    vproj_norm = vproj / np.max(vproj)
-    approx_xs = find_peaks_adaptive(
-        vproj_norm,
-        min_dist=peak_min_dist,
-        threshold_factor=peak_threshold_factor,
+
+def _tick_quality(tick: dict):
+    return (
+        float(tick.get('projection_strength', 0.0)),
+        int(tick.get('component_area', 0)),
+        int(tick.get('length', 0)),
     )
-
-    min_len_px = max(6, int(h * min_length_ratio))
-    ticks = []
-    for px in approx_xs:
-        x = int(px)
-        if x < 3 or x >= w - 3:
-            continue
-
-        strip = binary[:, max(0, x - 3):min(w, x + 4)]
-        col = np.sum(strip, axis=1)
-        threshold = _tick_row_threshold(col)
-        indices = np.where(col > threshold)[0]
-        if len(indices) < min_len_px // 2:
-            continue
-
-        segs = contiguous_segments(indices, min_len=5)
-        if not segs:
-            continue
-
-        if direction == "up":
-            anchored = [s for s in segs if s[1] >= anchor_limit]
-            seg = max(anchored, key=lambda s: s[1] - s[0]) if anchored else max(segs, key=lambda s: s[1])
-        else:
-            anchored = [s for s in segs if s[0] <= anchor_limit]
-            seg = max(anchored, key=lambda s: s[1] - s[0]) if anchored else min(segs, key=lambda s: s[0])
-
-        ys, ye = seg
-        length = ye - ys
-        if length < min_len_px:
-            continue
-
-        x_refined = _refine_tick_x(binary, x, ys, ye,
-                                   search_radius=max(4, min(10, min_len_px // 2)))
-        ticks.append({
-            'x': int(x_refined),
-            'y_start': int(ys),
-            'y_end': int(ye),
-            'y_mid': int((ys + ye) / 2),
-            'length': int(length),
-        })
-
-    ticks = _dedupe_ticks_by_x(ticks)
-    if ticks:
-        ml = float(np.median([t['length'] for t in ticks]))
-        factor = long_tick_factor if long_tick_factor is not None else config.main_scale.long_tick_factor
-        for t in ticks:
-            t['is_long'] = t['length'] > ml * factor
-    return ticks
-
-
-def _dedupe_ticks_by_x(ticks: List[dict], min_gap: int = 3) -> List[dict]:
-    if not ticks:
-        return []
-    out = []
-    for t in sorted(ticks, key=lambda item: item['x']):
-        if out and abs(t['x'] - out[-1]['x']) <= min_gap:
-            if t['length'] > out[-1]['length']:
-                out[-1] = t
-        else:
-            out.append(t)
-    return out
 
 
 def _refine_tick_x(binary: np.ndarray,
@@ -379,6 +211,38 @@ def _refine_tick_x(binary: np.ndarray,
     return max(0, min(w - 1, refined))
 
 
+def refine_tick_x_subpixel(gray: np.ndarray,
+                           approx_x: float,
+                           y_start: int,
+                           y_end: int,
+                           search_radius: int = 7) -> float:
+    if gray is None or gray.size == 0:
+        return float(approx_x)
+    h, w = gray.shape[:2]
+    x1 = max(0, int(round(approx_x)) - search_radius)
+    x2 = min(w, int(round(approx_x)) + search_radius + 1)
+    y1 = max(0, int(y_start))
+    y2 = min(h, int(y_end))
+    if x2 - x1 < 3 or y2 <= y1:
+        return float(approx_x)
+
+    patch = cv2.GaussianBlur(gray[y1:y2, x1:x2], (3, 1), 0).astype(float)
+    centers = []
+    mid = (patch.shape[1] - 1) / 2.0
+    left_idx = np.arange(0, int(np.floor(mid)) + 1)
+    right_idx = np.arange(int(np.ceil(mid)), patch.shape[1])
+    for row in patch:
+        gradient = np.gradient(row)
+        left = int(left_idx[np.argmin(gradient[left_idx])])
+        right = int(right_idx[np.argmax(gradient[right_idx])])
+        width = right - left
+        if width < 1 or width > 7 or gradient[left] >= -3 or gradient[right] <= 3:
+            continue
+        centers.append(x1 + (left + right) / 2.0)
+
+    return float(np.median(centers)) if centers else float(approx_x)
+
+
 def contiguous_segments(indices: np.ndarray, min_len: int = 5) -> List[tuple]:
     """将连续索引归并为线段"""
     if len(indices) < 2:
@@ -400,168 +264,109 @@ def refine_ticks_by_spacing(x_positions: np.ndarray,
                             gap_factor: float = 1.55,
                             dup_factor: float = 0.50,
                             snap_ratio: float = 0.28) -> np.ndarray:
+    """Refine tick candidates using an explicit, opt-in spacing model.
+
+    This helper is retained for standardization and calibration experiments.
+    It is deliberately not called by the production main-scale recognizer:
+    inserting a candidate on a theoretical grid can create a tick that is not
+    supported strongly enough by the image.  The function therefore returns
+    only research candidates and never mutates the input array or binary image.
+
+    The model estimates a robust period from the observed positions, fills a
+    large gap only when a nearby foreground column supports the expected
+    position, removes near-duplicate candidates by column strength, and snaps
+    small position errors to the observed grid.  It does not force a fixed
+    number of ticks.
     """
-    利用刻度线严格等间距的物理特性，补全遗漏 + 过滤误检。
+    if x_positions is None or binary is None or binary.ndim != 2:
+        return np.asarray([], dtype=float) if x_positions is None else np.asarray(x_positions, dtype=float)
 
-    核心思路
-    --------
-    游标卡尺的刻度线（无论主尺还是游标尺）相邻间距严格相等。
-    垂直投影峰值检测偶尔会漏掉某条线（对比度低、被噪声淹没），
-    或者把伪影误判为刻线。利用等间距约束可以极大提升鲁棒性。
-
-    算法步骤
-    --------
-    1) 由已检测刻线计算中位数间距 S（对少量异常值鲁棒）
-    2) 逐对扫描相邻刻线间距：
-       - gap > gap_factor * S  → 判定中间遗漏了刻线 → 在期望位置补入
-       - gap < dup_factor * S  → 判定其中一条是伪影 → 保留列信号更强的
-    3) 在二值图的期望 x 位置附近微搜索，精确定位补入的刻线
-    4) 全局网格快照：把每个刻线吸附到最近的等间距网格点上（容差 snap_ratio*S）
-
-    Args:
-        x_positions:      已排序的刻线 x 坐标 (int/float)
-        binary:           二值图（0/255, 白前景黑背景）
-        spacing_tolerance: 网格匹配容差比例（默认 0.30，即 30% 间距）
-        gap_factor:       间距 > S*gap_factor 时触发补全（默认 1.55）
-        dup_factor:       间距 < S*dup_factor 时触发去重（默认 0.50）
-        snap_ratio:       网格吸附容差比例（默认 0.28）
-
-    Returns:
-        精炼后的刻线 x 坐标 np.ndarray（float, 已排序）
-    """
-    xs = np.array(sorted(set(float(x) for x in x_positions)), dtype=float)
-    n = len(xs)
-    if n < 3:
+    xs = np.asarray(sorted(set(float(x) for x in x_positions)), dtype=float)
+    if xs.size < 3:
+        return xs
+    height, width = binary.shape[:2]
+    if height <= 0 or width <= 0:
         return xs
 
-    h, w = binary.shape
-
-    # ── 1. 中位数间距（过滤异常值：剔除 > 2.5*中位数 的 gap） ──
-    diffs_all = np.diff(xs)
-    median_raw = float(np.median(diffs_all))
-    if median_raw < 2.0:
+    diffs = np.diff(xs)
+    positive = diffs[diffs > 1.0]
+    if positive.size == 0:
         return xs
-    valid_diffs = diffs_all[diffs_all < median_raw * 2.5]
-    spacing = float(np.median(valid_diffs)) if len(valid_diffs) >= 2 else median_raw
-    if spacing < 2.0:
+    raw_period = float(np.median(positive))
+    valid = positive[positive <= raw_period * 2.5]
+    period = float(np.median(valid)) if valid.size else raw_period
+    if period < 2.0:
         return xs
 
-    tol = spacing * spacing_tolerance
-    gap_th = spacing * gap_factor
-    dup_th = spacing * dup_factor
+    gap_threshold = period * float(gap_factor)
+    duplicate_threshold = period * float(dup_factor)
+    search_radius = max(2, int(round(period * 0.28)))
 
-    # ── 辅助：在 x 附近搜索二值图中的最强列 ──
-    def _search_column(nominal_x: float, search_radius: int = None) -> float:
-        if search_radius is None:
-            search_radius = max(2, int(spacing * 0.28))
-        lo = max(0, int(nominal_x) - search_radius)
-        hi = min(w - 1, int(nominal_x) + search_radius)
-        if hi <= lo:
-            return nominal_x
-        strip = binary[:, lo:hi + 1]
-        col_sum = np.sum(strip, axis=0).astype(float)
-        best_offset = int(np.argmax(col_sum))
-        # 必须有足够信号才算有效
-        if col_sum[best_offset] < 255 * 3:
-            return nominal_x  # 信号太弱，不强行补
-        return float(lo + best_offset)
-
-    # ── 辅助：计算某 x 处的列信号强度 ──
-    def _column_strength(xx: float) -> float:
-        col = int(round(xx))
-        if col < 0 or col >= w:
+    def column_strength(position: float) -> float:
+        column = int(round(position))
+        if column < 0 or column >= width:
             return 0.0
-        return float(np.sum(binary[:, col]))
+        return float(np.sum(binary[:, column] > 0))
 
-    # ── 2. 逐对扫描：补全遗漏 ──
+    def supported_column(nominal: float):
+        lo = max(0, int(round(nominal)) - search_radius)
+        hi = min(width - 1, int(round(nominal)) + search_radius)
+        if hi < lo:
+            return None
+        strengths = np.sum(binary[:, lo:hi + 1] > 0, axis=0)
+        if strengths.size == 0:
+            return None
+        best = int(np.argmax(strengths))
+        # A weak column is not evidence for a missing tick.
+        if float(strengths[best]) < max(3.0, height * 0.10):
+            return None
+        return float(lo + best)
+
     filled = []
-    i = 0
-    while i < n:
-        filled.append(xs[i])
-        if i + 1 < n:
-            gap = xs[i + 1] - xs[i]
-            missing_count = round(gap / spacing) - 1
-            if missing_count >= 1 and gap > gap_th:
-                # 在 xs[i] 和 xs[i+1] 之间等距插入缺失的刻线
-                step = gap / (missing_count + 1)
-                for k in range(1, missing_count + 1):
-                    expected_x = xs[i] + k * step
-                    refined_x = _search_column(expected_x)
-                    filled.append(refined_x)
-        i += 1
+    for index, current in enumerate(xs[:-1]):
+        filled.append(float(current))
+        next_x = float(xs[index + 1])
+        gap = next_x - float(current)
+        missing = int(round(gap / period)) - 1
+        if missing <= 0 or gap <= gap_threshold:
+            continue
+        step = gap / float(missing + 1)
+        for missing_index in range(1, missing + 1):
+            nominal = float(current) + missing_index * step
+            candidate = supported_column(nominal)
+            if candidate is not None and abs(candidate - nominal) <= search_radius:
+                filled.append(candidate)
+    filled.append(float(xs[-1]))
 
-    # 排序 + 去重
-    filled = np.array(sorted(set(round(x, 1) for x in filled)), dtype=float)
+    filled = np.asarray(sorted(set(round(value, 1) for value in filled)), dtype=float)
+    if filled.size < 2:
+        return filled
 
-    # ── 3. 逐对扫描：去重（过密的伪影） ──
-    cleaned = [filled[0]]
-    for j in range(1, len(filled)):
-        gap = filled[j] - cleaned[-1]
-        if gap < dup_th:
-            # 保留列信号更强的那个
-            str_new = _column_strength(filled[j])
-            str_old = _column_strength(cleaned[-1])
-            if str_new > str_old:
-                cleaned[-1] = filled[j]
-            # 否则丢弃 filled[j]
+    cleaned = [float(filled[0])]
+    for candidate in filled[1:]:
+        if candidate - cleaned[-1] < duplicate_threshold:
+            if column_strength(candidate) > column_strength(cleaned[-1]):
+                cleaned[-1] = float(candidate)
         else:
-            cleaned.append(filled[j])
+            cleaned.append(float(candidate))
+    cleaned = np.asarray(cleaned, dtype=float)
 
-    cleaned = np.array(cleaned, dtype=float)
-
-    # ── 4. 全局网格吸附 ──
-    if len(cleaned) >= 3:
-        # 重新估算间距（用清理后的数据）
-        diffs2 = np.diff(cleaned)
-        spacing2 = float(np.median(diffs2[diffs2 < np.median(diffs2) * 2.5]))
-        if spacing2 >= 2.0:
-            # 以最左侧刻线为基准，生成完整网格
-            origin = cleaned[0]
+    if cleaned.size >= 3:
+        gaps = np.diff(cleaned)
+        valid_gaps = gaps[gaps > 1.0]
+        grid_period = float(np.median(valid_gaps)) if valid_gaps.size else period
+        if grid_period >= 2.0:
+            origin = float(cleaned[0])
             snapped = []
-            for x in cleaned:
-                k = round((x - origin) / spacing2)
-                grid_x = origin + k * spacing2
-                if abs(x - grid_x) <= spacing2 * snap_ratio:
-                    snapped.append(grid_x)
+            for candidate in cleaned:
+                grid = origin + round((candidate - origin) / grid_period) * grid_period
+                if abs(candidate - grid) <= grid_period * float(snap_ratio):
+                    snapped.append(grid)
                 else:
-                    # 偏离太大，保留原值（可能是真实偏移）
-                    snapped.append(x)
-            cleaned = np.array(sorted(set(round(x, 1) for x in snapped)), dtype=float)
-
-    # ── 5. 网格边缘延伸：从最左/最右向图像边界扩展 ──
-    #     物理依据：刻度线布满整个主尺/游标尺区域，检测到的第一条/最后
-    #     一条线未必是真正的第一/最后一条。沿等间距网格向两侧延伸到图像
-    #     边界，在预期位置搜索列信号，有足够强度即确认该刻线存在。
-    if len(cleaned) >= 3:
-        spacing3 = float(np.median(np.diff(cleaned)))
-        if spacing3 >= 2.0:
-            origin = cleaned[0] if len(cleaned) > 0 else 0.0
-
-            # 向左延伸
-            x = origin - spacing3
-            while x >= spacing3 * 0.3:  # 至少离左边界还有一定距离
-                found_x = _search_column(x, search_radius=max(2, int(spacing3 * 0.3)))
-                if found_x != x:  # _search_column 找到了有效信号
-                    cleaned = np.append(cleaned, found_x)
-                x -= spacing3
-
-            # 向右延伸
-            last_x = cleaned[-1] if len(cleaned) > 0 else origin
-            x = last_x + spacing3
-            while x <= w - spacing3 * 0.3:
-                found_x = _search_column(x, search_radius=max(2, int(spacing3 * 0.3)))
-                if found_x != x:
-                    cleaned = np.append(cleaned, found_x)
-                x += spacing3
-
-            cleaned = np.array(sorted(set(round(x, 1) for x in cleaned)), dtype=float)
-
+                    snapped.append(candidate)
+            cleaned = np.asarray(sorted(set(round(value, 1) for value in snapped)), dtype=float)
     return cleaned
 
-
-# ═════════════════════════════════════════════════════════════
-#  可视化工具
-# ═════════════════════════════════════════════════════════════
 
 def make_comparison_vis(left_img: np.ndarray, right_img: np.ndarray,
                          left_label: str = "", right_label: str = "",
@@ -635,27 +440,6 @@ def draw_projection_plot(signal: np.ndarray, peaks: np.ndarray = None,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
     return plot
-
-
-def draw_legend(image: np.ndarray, items: list,
-                x: int = 8, y_start: int = 50, line_h: int = 18) -> np.ndarray:
-    """
-    在图像上叠加图例。
-    items: [(标签, 颜色, 样式), ...]
-      样式: 'line', 'rect', 'circle', 'text'
-    返回原地修改的图像引用。
-    """
-    for i, (label, color, style) in enumerate(items):
-        cy = y_start + i * line_h
-        if style == 'line':
-            cv2.line(image, (x, cy), (x + 24, cy), color, 2)
-        elif style == 'rect':
-            cv2.rectangle(image, (x, cy - 6), (x + 24, cy + 6), color, 1)
-        elif style == 'circle':
-            cv2.circle(image, (x + 12, cy), 5, color, -1)
-        cv2.putText(image, label, (x + 30, cy + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1)
-    return image
 
 
 def draw_legend_below(image: np.ndarray, items: list, line_h: int = 18) -> np.ndarray:

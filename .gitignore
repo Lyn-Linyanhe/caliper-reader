@@ -26,3 +26,28 @@ param_visualizations/
 # IDE
 .vscode/
 .idea/
+
+# Local test and audit caches
+.pytest_cache/
+.pytest_tmp/
+.pytest_tmp*/
+.tmp_*
+.tmp_*/
+
+# Local debug/export scratch files
+tmp_*/
+tmp_*.png
+tmp_*.jpg
+/*.png
+/*.jpg
+/123.jpg
+
+# Local image dataset and paper deliverables
+/tupian/
+/paper/
+/*.docx
+/*.pdf
+
+# Superpowers review artifacts (keep checked-in plans/specs only)
+.superpowers/sdd/review-*.diff
+.superpowers/sdd/task-*.md

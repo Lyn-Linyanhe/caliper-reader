@@ -29,6 +29,18 @@ def test_detailed_main_result_contains_width_aligned_standardization():
     assert len(standard['ticks']) == len(result['main_ticks'])
 
 
+def test_main_standardization_uses_center_stems_and_reports_quality():
+    result = recognize_main_scale(_main_region(), make_debug=True)
+    standard = result['standardization']
+    classification = standard['classification']
+
+    assert classification['response_kernel'] == 'center_stem'
+    assert classification['formal_tick_count'] == len(result['main_ticks'])
+    assert classification['display_tick_count'] == len(result['main_ticks'])
+    assert classification['spacing_consistency'] > 0.95
+    assert classification['acceptance_status'] == 'complete'
+
+
 def test_fast_main_result_does_not_compute_standardization():
     result = recognize_main_scale(_main_region(), make_debug=False)
     assert result['standardization'] is None
