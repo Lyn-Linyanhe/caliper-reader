@@ -56,6 +56,6 @@
 **Files:**
 - Commit: all approved staged files
 
-- [ ] Create one descriptive commit on the current `master` branch.
-- [ ] Fetch `origin`, verify the remote branch has not advanced unexpectedly, then push normally with `git push origin master`.
-- [ ] Confirm the pushed commit and working-tree status, leaving excluded local artifacts untouched.
+- [x] Create one descriptive commit on the current `master` branch.
+- [x] Fetch `origin`, verify the remote branch has not advanced unexpectedly, then push normally with `git push origin master`.
+- [x] Confirm the pushed commit and working-tree status, leaving excluded local artifacts untouched.
