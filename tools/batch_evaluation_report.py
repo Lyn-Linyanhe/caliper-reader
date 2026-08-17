@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -46,10 +47,8 @@ FIELDNAMES: tuple[str, ...] = (
 
 
 def truth_from_name(path: Path) -> float | None:
-    try:
-        return float(path.stem)
-    except ValueError:
-        return None
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)", path.stem)
+    return float(match.group(1)) if match else None
 
 
 def truth_for_path(
@@ -151,7 +150,7 @@ def normalize_row(
 
 def build_summary(
     rows: Sequence[Mapping[str, Any]],
-    tolerances: Sequence[float] = (0.02, 0.10, 0.50),
+    tolerances: Sequence[float] = (0.00, 0.02, 0.04, 0.06, 0.10, 0.50),
 ) -> dict[str, Any]:
     labelled = [
         row for row in rows

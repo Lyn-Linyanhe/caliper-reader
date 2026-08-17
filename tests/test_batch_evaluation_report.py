@@ -24,6 +24,10 @@ def test_truth_from_numeric_filename():
     assert truth_from_name(Path("100.60.jpg")) == 100.60
 
 
+def test_truth_from_numeric_filename_with_copy_suffix():
+    assert truth_from_name(Path("70.94(1).jpg")) == 70.94
+
+
 def test_truth_from_non_numeric_filename_returns_none():
     assert truth_from_name(Path("wechat_sample.jpg")) is None
 
@@ -59,6 +63,19 @@ def test_normalize_row_adds_human_review_columns():
     assert row["tolerance_mm"] == 0.02
     assert row["error_module_final"] == ""
     assert row["error_notes"] == ""
+
+
+def test_summary_includes_requested_accuracy_bands_by_default():
+    summary = build_summary(
+        [
+            normalize_row(
+                {"image": "a.jpg", "truth_mm": 1.0, "reading_mm": 1.0, "status": "ok"},
+                tolerance=0.02,
+            )
+        ]
+    )
+    for tolerance in (0.00, 0.02, 0.04, 0.06, 0.10, 0.50):
+        assert f"within_{tolerance:.2f}mm".replace(".", "_") in summary
 
 
 def test_failed_row_classifies_as_pipeline():

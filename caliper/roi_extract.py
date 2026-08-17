@@ -125,7 +125,17 @@ def locate_roi_lowres(img_color: np.ndarray,
     compact_box = selection_info['candidate_boxes'].get('compact')
     if (selection_info.get('selected_stage') == 'compact'
             and compact_box is not None):
-        for candidate in _build_local_roi_recovery_candidates(compact_box, body_box):
+        lowres_candidates = _build_local_roi_recovery_candidates(compact_box, body_box)
+    elif selection_info.get('selected_stage') == 'body':
+        lowres_candidates = _build_outer_roi_recovery_candidates(
+            body_box,
+            selection_info.get('full_y_body'),
+            x_diag,
+        )
+    else:
+        lowres_candidates = []
+    if lowres_candidates:
+        for candidate in lowres_candidates:
             cy1, cy2, cx1, cx2 = candidate['box']
             cox1 = int(np.floor(cx1 * inv_scale))
             coy1 = int(np.floor(cy1 * inv_scale))
@@ -615,6 +625,11 @@ def _select_reading_roi_candidate(enhanced: np.ndarray,
         },
         'selected_stage': 'body',
         'fallback_reason': None,
+        'full_y_body': (
+            dict(x_diag.get('full_y_body'))
+            if isinstance(x_diag, dict) and isinstance(x_diag.get('full_y_body'), dict)
+            else None
+        ),
     }
     if compact is not None and structure_validator(enhanced, compact, x_diag):
         info['selected_stage'] = 'compact'
@@ -629,7 +644,7 @@ def _select_reading_roi_candidate(enhanced: np.ndarray,
 
 
 def _build_local_roi_recovery_candidates(compact_box: tuple,
-                                         body_box: tuple) -> list:
+                                          body_box: tuple) -> list:
     """Return small x-only compact-ROI expansions bounded by the body ROI."""
     if compact_box is None or body_box is None:
         return []
@@ -668,6 +683,53 @@ def _build_local_roi_recovery_candidates(compact_box: tuple,
     for candidate in raw:
         unique.setdefault(candidate['box'], candidate)
     return sorted(unique.values(), key=lambda item: (item['added_area'], item['name']))
+
+
+def _build_outer_roi_recovery_candidates(body_box: tuple,
+                                          full_y_body: dict,
+                                          x_diag: dict = None) -> list:
+    """Build one bounded candidate from the full-height body evidence.
+
+    The projection span can start inside the slider body and end in the ruler
+    tail.  This candidate restores only a small number of measured tick gaps
+    around the independently detected full-body span; it does not reopen the
+    global ROI candidate ordering.
+    """
+    if body_box is None or not isinstance(full_y_body, dict):
+        return []
+    body_range = full_y_body.get('body_range')
+    if not body_range or len(body_range) < 2:
+        return []
+    y1, y2, x1, x2 = (int(value) for value in body_box)
+    body_x1, body_x2 = (int(value) for value in body_range[:2])
+    if y2 <= y1 or x2 <= x1 or body_x2 <= body_x1:
+        return []
+
+    body_width = body_x2 - body_x1
+    tick_gap = _reading_window_tick_gap(x_diag, body_width)
+    margin = max(8, int(round(tick_gap * 2.0)))
+    left_missing = max(0, x1 - body_x1)
+    right_tail = max(0, x2 - body_x2)
+    # A recovery is meaningful only when both measurements indicate that the
+    # selected body box is geometrically asymmetric around the full body.
+    trigger_gap = max(margin, int(round(body_width * 0.04)))
+    if left_missing < trigger_gap or right_tail < trigger_gap:
+        return []
+
+    nx1 = max(0, body_x1 - margin)
+    nx2 = body_x2 + margin
+    if nx2 <= nx1:
+        return []
+    return [{
+        'name': 'full_body_bounded',
+        'box': (y1, y2, nx1, nx2),
+        'added_area': (nx2 - nx1) * (y2 - y1) - (x2 - x1) * (y2 - y1),
+        'recovery_reason': 'projection_body_asymmetry',
+        'full_body_range': (body_x1, body_x2),
+        'tick_gap': float(tick_gap),
+        'left_missing': int(left_missing),
+        'right_tail': int(right_tail),
+    }]
 
 
 def _guard_x_range_with_full_body(enhanced: np.ndarray,

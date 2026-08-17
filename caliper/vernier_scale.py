@@ -1031,6 +1031,110 @@ def _recover_binary_top_evidence_ticks(
     return merged
 
 
+def _promote_leading_binary_evidence_candidates(
+    band_detection: dict,
+) -> tuple[list[dict], dict]:
+    """Promote an observed leading run when formal projection starts late.
+
+    The normal projection detector can miss the first few vernier strokes when
+    the zero line is attached to the slide edge.  Promotion is deliberately
+    narrower than the diagnostic recovery path: only real top-projection
+    pixels before the first formal candidate are considered, and they must
+    form a near-periodic run anchored to the left valley boundary.  Internal
+    gaps and theoretical positions are never promoted here.
+    """
+    detection = band_detection or {}
+    formal = [dict(candidate) for candidate in
+              (detection.get('tick_candidates') or [])]
+    metadata = {
+        'applied': False,
+        'promoted_count': 0,
+        'formal_count': len(formal),
+        'reason': 'insufficient_formal_candidates',
+    }
+    band = detection.get('band')
+    try:
+        expected_gap = float(detection.get('expected_gap', 0.0))
+    except (TypeError, ValueError):
+        expected_gap = 0.0
+    roi = detection.get('vernier_tick_roi')
+    if (band is None or getattr(band, 'ndim', 0) != 2
+            or band.size == 0 or expected_gap <= 2.0
+            or roi is None or len(formal) < 3):
+        return formal, metadata
+
+    formal_xs = sorted({
+        int(round(float(candidate.get('x_projection'))))
+        for candidate in formal
+        if candidate.get('x_projection') is not None
+    })
+    if len(formal_xs) < 3:
+        return formal, metadata
+
+    recovery_records = _recover_binary_top_evidence_ticks(
+        {
+            'band': band,
+            'expected_gap': expected_gap,
+            'vernier_tick_roi': roi,
+        },
+        formal,
+        int(detection.get('x1', 0)),
+        int(detection.get('x2', band.shape[1])) - int(detection.get('x1', 0)),
+    )
+    leading = sorted({
+        int(round(float(record.get('x_projection'))))
+        for record in recovery_records
+        if record.get('source') == 'binary_top_evidence'
+        and record.get('x_projection') is not None
+        and float(record.get('x_projection')) < formal_xs[0]
+    })
+    metadata['recovery_candidate_count'] = len(leading)
+    if not leading:
+        metadata['reason'] = 'no_leading_binary_evidence'
+        return formal, metadata
+
+    roi_start = float(min(roi))
+    boundary_tolerance = max(3.0, expected_gap * 0.45)
+    if float(leading[0]) - roi_start > boundary_tolerance:
+        metadata['reason'] = 'leading_evidence_not_anchored_to_left_valley'
+        return formal, metadata
+
+    # Walk backwards from the first formal stroke.  This rejects an unrelated
+    # digit/hardware stroke even if it happens to be before the ROI.
+    selected_leading = []
+    next_x = float(formal_xs[0])
+    for candidate_x in reversed(leading):
+        gap = next_x - float(candidate_x)
+        if gap < expected_gap * 0.55 or gap > expected_gap * 1.35:
+            break
+        selected_leading.append(candidate_x)
+        next_x = float(candidate_x)
+    selected_leading.reverse()
+    if len(selected_leading) < 2:
+        metadata['reason'] = 'leading_evidence_not_periodic'
+        return formal, metadata
+
+    promoted = []
+    for candidate_x in selected_leading:
+        promoted.append({
+            'x_projection': int(candidate_x),
+            'projection_strength': 0.0,
+            'component_id': None,
+            'component': None,
+            'spacing_error': 0.0,
+            'source': 'observed_binary_leading_recovery',
+        })
+    metadata.update({
+        'applied': True,
+        'promoted_count': len(promoted),
+        'reason': 'periodic_leading_binary_evidence',
+        'first_formal_x': int(formal_xs[0]),
+        'first_promoted_x': int(promoted[0]['x_projection']),
+        'left_boundary_gap': float(promoted[0]['x_projection'] - roi_start),
+    })
+    return promoted + formal, metadata
+
+
 def _draw_vernier_ticks_on_band(region: dict,
                                 vernier_ticks: List[dict],
                                 zero_x: float,
@@ -1765,6 +1869,31 @@ def _detect_vernier_band_projection(binary: np.ndarray,
     if raw_analysis is None:
         return None
 
+    # A clipped zero line can be absent from the thresholded projection even
+    # though its thin top stroke is visible in the binary band.  Promote only
+    # an observed, left-anchored periodic extension; all other recovery stays
+    # diagnostic-only.
+    promoted_candidates, formal_recovery = (
+        _promote_leading_binary_evidence_candidates({
+            'band': band,
+            'x1': x1,
+            'x2': x2,
+            'expected_gap': raw_analysis['expected_gap'],
+            'vernier_tick_roi': raw_analysis['vernier_tick_roi'],
+            'tick_candidates': raw_analysis['tick_candidates'],
+        })
+    )
+    if formal_recovery.get('applied'):
+        raw_analysis = dict(raw_analysis)
+        raw_analysis['tick_candidates'] = promoted_candidates
+        raw_analysis['tick_xs'] = [
+            int(candidate['x_projection'])
+            for candidate in promoted_candidates
+        ]
+        raw_analysis['formal_recovery'] = formal_recovery
+    else:
+        raw_analysis['formal_recovery'] = formal_recovery
+
     formal_candidate_xs = [
         int(candidate['x_projection'])
         for candidate in raw_analysis['tick_candidates']
@@ -1869,6 +1998,7 @@ def _detect_vernier_band_projection(binary: np.ndarray,
                 'binary_top_projection_periodic_run'
                 if recovered_candidate_xs else 'formal_projection'
             ),
+            'formal_recovery': formal_recovery,
             'band_height': int(band.shape[0]),
             'band_y1': int(band_y1),
             'band_y2': int(band_y2),
@@ -1915,6 +2045,7 @@ def _detect_vernier_band_projection(binary: np.ndarray,
         'spacing_score': raw_analysis['spacing_score'],
         'component_support': raw_analysis['component_support'],
         'tick_structure': raw_analysis['tick_structure'],
+        'formal_recovery': raw_analysis.get('formal_recovery'),
         'per_tick_correction': per_tick_correction,
     }
 

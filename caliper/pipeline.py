@@ -11,7 +11,7 @@ from .config import config
 from .main_scale import recognize_main_scale
 from .merger import merge_readings
 from .preprocess import preprocess
-from .region_split import split_scales
+from .region_split import build_split_recovery_result, split_scales
 from .result import CaliperResult
 from .roi_extract import locate_roi_lowres, orient_caliper
 from .utils import draw_legend_below
@@ -88,8 +88,10 @@ class CaliperPipeline:
         initial = self._run_from_roi_result(original, roi_result, progress_callback)
         vernier = self.step_results.get('vernier', {})
         candidates = roi_result.get('roi_recovery_candidates', [])
-        if (vernier.get('error') != 'no_reliable_valley_bounded_tick_range'
-                or not candidates):
+        # A partial vernier run may carry ``error=None`` even though it is too
+        # short to establish the scale range.  Use the same evidence gate as
+        # recovery acceptance so short runs do not bypass the ROI fallback.
+        if self._vernier_result_is_reliable(vernier) or not candidates:
             return initial
 
         initial_state = (self.debug_images, self.step_results, self.timings)
@@ -123,11 +125,14 @@ class CaliperPipeline:
                 return recovered
 
         self.debug_images, self.step_results, self.timings = initial_state
-        initial.extra_info['roi_recovery'] = {
+        recovery_info = {
             'triggered': True,
             'selected_candidate': None,
             'attempts': attempts,
         }
+        initial.extra_info['roi_recovery'] = recovery_info
+        if isinstance(self.step_results.get('roi'), dict):
+            self.step_results['roi']['roi_recovery'] = recovery_info
         return initial
 
     def _run_from_roi_result(self, original: np.ndarray,
@@ -228,6 +233,131 @@ class CaliperPipeline:
             and float(vernier_result.get('zero_x', 0.0)) > 0.0
         )
 
+    @staticmethod
+    def _split_recovery_is_reliable(main_result: dict,
+                                    vernier_result: dict) -> tuple[bool, str]:
+        """Gate a later-band split with measured geometry and valley evidence."""
+        if vernier_result.get('error'):
+            return False, str(vernier_result.get('error'))
+        main_ticks = main_result.get('main_ticks') or []
+        vernier_ticks = vernier_result.get('vernier_ticks') or []
+        detection = vernier_result.get('vernier_band_detection') or {}
+        if len(main_ticks) < 10 or len(vernier_ticks) < 10:
+            return False, 'insufficient_observed_tick_run'
+
+        main_gap = float(main_result.get('main_gap', 0.0) or 0.0)
+        expected_gap = float(detection.get('expected_gap', 0.0) or 0.0)
+        if main_gap <= 3.0 or expected_gap <= 3.0:
+            return False, 'missing_period_measurement'
+        if not 0.70 <= expected_gap / main_gap <= 1.30:
+            return False, 'main_vernier_period_mismatch'
+
+        selection_score = float(detection.get('selection_score', 0.0) or 0.0)
+        period_clarity = float(detection.get('period_clarity', 0.0) or 0.0)
+        tick_structure = float(detection.get('tick_structure', 0.0) or 0.0)
+        if selection_score < config.vernier_scale.valley_min_total_score:
+            return False, 'weak_valley_pair_score'
+        if period_clarity < config.vernier_scale.valley_min_period_clarity:
+            return False, 'weak_period_clarity'
+        if tick_structure < config.vernier_scale.valley_min_component_structure:
+            return False, 'weak_tick_structure'
+
+        roi = detection.get('vernier_tick_roi')
+        if not roi or len(roi) != 2:
+            return False, 'missing_vernier_tick_roi'
+        boundary_x = float(detection.get('x1', 0)) + float(roi[0])
+        zero_x = float(vernier_result.get('zero_x', 0.0) or 0.0)
+        if abs(zero_x - boundary_x) > expected_gap * 0.75:
+            return False, 'zero_not_anchored_to_left_valley'
+
+        observed_xs = sorted(float(t.get('x_precise', t.get('x', 0.0)))
+                             for t in vernier_ticks)
+        if len(observed_xs) < 2:
+            return False, 'missing_vernier_span'
+        observed_span = observed_xs[-1] - observed_xs[0]
+        if observed_span < expected_gap * 10.0:
+            return False, 'vernier_run_too_short'
+        main_xs = sorted(float(t.get('x_precise', t.get('x', 0.0)))
+                         for t in main_ticks)
+        if len(main_xs) < 2 or main_xs[-1] - main_xs[0] < main_gap * 10.0:
+            return False, 'main_run_too_short'
+        return True, 'periodic_valley_bounded_observed_run'
+
+    def _try_split_starvation_recovery(self,
+                                       rotated_gray: np.ndarray,
+                                       rotated_binary: np.ndarray,
+                                       rotated_color: np.ndarray,
+                                       split_result: dict,
+                                       main_gap_prior: float,
+                                       make_debug: bool):
+        """Try measured later bands only after the current vernier is empty."""
+        candidates = split_result.get('split_recovery_candidates') or []
+        attempts = []
+        if not candidates:
+            return None, None, None
+
+        for candidate in candidates:
+            candidate_split = build_split_recovery_result(
+                rotated_gray,
+                rotated_binary,
+                rotated_color,
+                split_result,
+                candidate,
+                make_debug=make_debug,
+            )
+            region_main = candidate_split['region_main']
+            region_vernier = candidate_split['region_vernier']
+            main_color = rotated_color[:candidate_split['split_y'], :]
+            main_result = recognize_main_scale(
+                region_main, main_color, make_debug=make_debug
+            )
+            vernier_color = rotated_color[candidate_split['split_y']:, :]
+            vernier_result = recognize_vernier_scale(
+                region_vernier,
+                main_result.get('main_gap', main_gap_prior),
+                vernier_color,
+                main_result.get('main_ticks', []),
+                make_debug=make_debug,
+            )
+            accepted, reason = self._split_recovery_is_reliable(
+                main_result, vernier_result
+            )
+            detection = vernier_result.get('vernier_band_detection') or {}
+            attempts.append({
+                'name': candidate.get('name'),
+                'split_y': candidate.get('split_y'),
+                'offset': candidate.get('offset'),
+                'main_tick_count': len(main_result.get('main_ticks', [])),
+                'main_gap': main_result.get('main_gap'),
+                'vernier_tick_count': len(vernier_result.get('vernier_ticks', [])),
+                'zero_x': vernier_result.get('zero_x'),
+                'selection_score': detection.get('selection_score'),
+                'period_clarity': detection.get('period_clarity'),
+                'accepted': bool(accepted),
+                'reason': reason,
+            })
+            if not accepted:
+                continue
+
+            recovery = {
+                'triggered': True,
+                'reason': 'initial_vernier_starvation',
+                'original_split_y': int(split_result['split_y']),
+                'selected_candidate': candidate.get('name'),
+                'attempts': attempts,
+            }
+            candidate_split['split_recovery'] = recovery
+            candidate_split['tick_bands']['split_recovery'] = recovery
+            return candidate_split, main_result, vernier_result
+
+        return {
+            'triggered': True,
+            'reason': 'initial_vernier_starvation',
+            'original_split_y': int(split_result['split_y']),
+            'selected_candidate': None,
+            'attempts': attempts,
+        }, None, None
+
     def _run_remainder(self, original: np.ndarray,
                        orient_result: dict,
                        progress_callback=None) -> CaliperResult:
@@ -265,6 +395,40 @@ class CaliperPipeline:
             make_debug=not self.fast_mode,
         )
         self._record_timing('vernier_scale', '游标刻线识别与对齐', t0)
+
+        split_recovery = None
+        recovered_main = None
+        recovered_vernier = None
+        if vernier_result.get('error') == 'no_reliable_valley_bounded_tick_range':
+            split_recovery, recovered_main, recovered_vernier = (
+                self._try_split_starvation_recovery(
+                    rotated_gray,
+                    rotated_binary,
+                    rotated_color,
+                    split_result,
+                    main_result.get('main_gap', 0.0),
+                    make_debug=not self.fast_mode,
+                )
+            )
+            if recovered_main is not None and recovered_vernier is not None:
+                split_result = split_recovery
+                main_result = recovered_main
+                vernier_result = recovered_vernier
+                region_main = split_result['region_main']
+                region_vernier = split_result['region_vernier']
+                split_y = split_result['split_y']
+                main_color = rotated_color[:split_y, :]
+                vernier_color = rotated_color[split_y:, :]
+                self.step_results['split'] = split_result
+                self.step_results['main'] = main_result
+                if split_result.get('split_vis') is not None:
+                    self.debug_images['2_区域分离'] = split_result['split_vis']
+                if main_result.get('vis_ticks') is not None:
+                    self.debug_images['3a_主尺刻度线'] = main_result['vis_ticks']
+
+        if split_recovery is not None and recovered_main is None:
+            split_result['split_recovery'] = split_recovery
+            split_result['tick_bands']['split_recovery'] = split_recovery
 
         if not self.fast_mode:
             if vernier_result.get('vis_ticks') is not None:

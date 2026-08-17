@@ -206,6 +206,59 @@ def test_recovery_keeps_formal_candidate_without_top_evidence():
                for record in records)
 
 
+def test_formal_recovery_promotes_only_periodic_leading_binary_evidence():
+    band = np.zeros((48, 180), dtype=np.uint8)
+    for x in (20, 40, 60, 80, 100, 120, 140):
+        band[:36, x] = 255
+    detection = {
+        'band': band,
+        'expected_gap': 20.0,
+        'vernier_tick_roi': (18, 142),
+        'tick_candidates': [
+            {'x_projection': x, 'component': None}
+            for x in (80, 100, 120, 140)
+        ],
+    }
+
+    candidates, recovery = vernier_scale._promote_leading_binary_evidence_candidates(
+        detection
+    )
+
+    assert recovery['applied'] is True
+    assert recovery['promoted_count'] == 3
+    assert [candidate['x_projection'] for candidate in candidates] == pytest.approx(
+        [20, 40, 60, 80, 100, 120, 140], abs=2
+    )
+    assert all(
+        candidate.get('source') == 'observed_binary_leading_recovery'
+        for candidate in candidates[:3]
+    )
+
+
+def test_formal_recovery_rejects_leading_evidence_far_from_left_valley():
+    band = np.zeros((48, 180), dtype=np.uint8)
+    for x in (40, 60, 80, 100, 120, 140):
+        band[:36, x] = 255
+    detection = {
+        'band': band,
+        'expected_gap': 20.0,
+        'vernier_tick_roi': (10, 142),
+        'tick_candidates': [
+            {'x_projection': x, 'component': None}
+            for x in (80, 100, 120, 140)
+        ],
+    }
+
+    candidates, recovery = vernier_scale._promote_leading_binary_evidence_candidates(
+        detection
+    )
+
+    assert recovery['applied'] is False
+    assert [candidate['x_projection'] for candidate in candidates] == [
+        80, 100, 120, 140
+    ]
+
+
 def test_per_tick_diagnostics_keep_an_entry_for_every_formal_candidate():
     band = np.zeros((40, 40), dtype=np.uint8)
     band[:, 8] = 255

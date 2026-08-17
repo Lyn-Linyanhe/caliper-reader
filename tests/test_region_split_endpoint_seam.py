@@ -20,9 +20,10 @@ def test_4020_reports_projection_valley_fallback_when_endpoint_evidence_is_weak(
     vernier = pipeline.step_results['vernier']
 
     assert split['seam_source'] == 'projection_valley'
-    assert split['split_y'] == 573
-    assert vernier['error'] == 'no_reliable_valley_bounded_tick_range'
-    assert vernier['vernier_ticks'] == []
+    assert split['split_recovery']['original_split_y'] == 573
+    assert split['split_y'] == 776
+    assert split['split_recovery']['selected_candidate'] is not None
+    assert len(vernier['vernier_ticks']) >= 20
 
 
 def test_normal_endpoint_samples_keep_vernier_evidence():

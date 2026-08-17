@@ -238,7 +238,31 @@ def refine_tick_x_subpixel(gray: np.ndarray,
         width = right - left
         if width < 1 or width > 7 or gradient[left] >= -3 or gradient[right] <= 3:
             continue
-        centers.append(x1 + (left + right) / 2.0)
+
+        # Fit a local parabola around each gradient extremum.  The original
+        # integer extremum remains the anchor; the correction is deliberately
+        # blended by half so that subpixel precision improves without letting
+        # a noisy edge move the tick by the full continuous estimate.
+        def _parabolic_offset(index: int) -> float:
+            if index <= 0 or index >= len(gradient) - 1:
+                return 0.0
+            y_prev = float(gradient[index - 1])
+            y_curr = float(gradient[index])
+            y_next = float(gradient[index + 1])
+            denominator = y_prev - 2.0 * y_curr + y_next
+            if abs(denominator) < 1e-9:
+                return 0.0
+            offset = 0.5 * (y_prev - y_next) / denominator
+            if not np.isfinite(offset):
+                return 0.0
+            return float(np.clip(offset, -0.5, 0.5))
+
+        base_center = x1 + (left + right) / 2.0
+        continuous_center = x1 + (
+            left + _parabolic_offset(left) +
+            right + _parabolic_offset(right)
+        ) / 2.0
+        centers.append(base_center + 0.5 * (continuous_center - base_center))
 
     return float(np.median(centers)) if centers else float(approx_x)
 

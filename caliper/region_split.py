@@ -61,29 +61,15 @@ def split_scales(rotated_gray: np.ndarray,
     band_info.update(seam_info)
     band_info.update(endpoint_bands)
 
-    # ── 切分 ──
-    img_upper = rotated_gray[:split_y, :]
-    img_lower = rotated_gray[split_y:, :]
-    bin_upper = binary[:split_y, :]
-    bin_lower = binary[split_y:, :]
-
-    main_band_local = (max(0, main_band[0]), min(split_y, main_band[1]))
-    vernier_band_local = (
-        max(0, vernier_band[0] - split_y),
-        min(h - split_y, vernier_band[1] - split_y),
+    region_main, region_vernier = _make_scale_regions(
+        rotated_gray, binary, split_y, main_band, vernier_band
     )
-    region_main = {
-        'image': img_upper, 'binary': bin_upper,
-        'y_offset': 0, 'height': split_y,
-        'tick_band': main_band_local,
-        'tick_band_global': main_band,
-    }
-    region_vernier = {
-        'image': img_lower, 'binary': bin_lower,
-        'y_offset': split_y, 'height': h - split_y,
-        'tick_band': vernier_band_local,
-        'tick_band_global': vernier_band,
-    }
+
+    recovery_candidates = []
+    if seam_source == 'projection_valley':
+        recovery_candidates = _build_split_starvation_recovery_candidates(
+            band_info, split_y, h
+        )
 
     split_vis = None
     if make_debug:
@@ -98,7 +84,166 @@ def split_scales(rotated_gray: np.ndarray,
         'seam_source': seam_source,
         'tick_bands': band_info,
         'split_vis': split_vis,
+        'split_recovery_candidates': recovery_candidates,
     }
+
+
+def build_split_recovery_result(rotated_gray: np.ndarray,
+                                rotated_binary: np.ndarray,
+                                rotated_color: np.ndarray,
+                                base_split_result: dict,
+                                candidate: dict,
+                                make_debug: bool = True) -> dict:
+    """Build regions for one measured later-band candidate.
+
+    The caller remains responsible for validating the candidate with the
+    normal main/vernier recognizers.  This function only applies measured row
+    bands; it does not generate or fit any tick positions.
+    """
+    if rotated_binary is None:
+        _, binary = cv2.threshold(
+            rotated_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )
+    else:
+        binary = rotated_binary
+
+    h = int(rotated_gray.shape[0])
+    split_y = max(1, min(h - 1, int(candidate['split_y'])))
+    main_band = tuple(int(value) for value in candidate['main_tick_band'])
+    vernier_band = tuple(int(value) for value in candidate['vernier_tick_band'])
+    region_main, region_vernier = _make_scale_regions(
+        rotated_gray, binary, split_y, main_band, vernier_band
+    )
+
+    band_info = dict(base_split_result.get('tick_bands') or {})
+    band_info.update({
+        'main_tick_band': main_band,
+        'vernier_tick_band': vernier_band,
+        'recovery_candidate': dict(candidate),
+    })
+    split_vis = None
+    if make_debug:
+        split_vis = _make_split_vis(
+            rotated_color if rotated_color is not None else rotated_gray,
+            rotated_gray,
+            binary,
+            split_y,
+            band_info,
+        )
+
+    return {
+        'region_main': region_main,
+        'region_vernier': region_vernier,
+        'split_y': split_y,
+        'seam_source': base_split_result.get('seam_source', 'projection_valley'),
+        'tick_bands': band_info,
+        'split_vis': split_vis,
+        'split_recovery_candidates': base_split_result.get(
+            'split_recovery_candidates', []
+        ),
+    }
+
+
+def _make_scale_regions(gray: np.ndarray,
+                        binary: np.ndarray,
+                        split_y: int,
+                        main_band: tuple,
+                        vernier_band: tuple):
+    h = int(gray.shape[0])
+    split_y = max(1, min(h - 1, int(split_y)))
+    main_band_global = (
+        max(0, min(split_y, int(main_band[0]))),
+        max(1, min(split_y, int(main_band[1]))),
+    )
+    vernier_band_global = (
+        max(split_y, min(h - 1, int(vernier_band[0]))),
+        max(split_y + 1, min(h, int(vernier_band[1]))),
+    )
+    region_main = {
+        'image': gray[:split_y, :],
+        'binary': binary[:split_y, :],
+        'y_offset': 0,
+        'height': split_y,
+        'tick_band': main_band_global,
+        'tick_band_global': main_band_global,
+    }
+    region_vernier = {
+        'image': gray[split_y:, :],
+        'binary': binary[split_y:, :],
+        'y_offset': split_y,
+        'height': h - split_y,
+        'tick_band': (
+            vernier_band_global[0] - split_y,
+            vernier_band_global[1] - split_y,
+        ),
+        'tick_band_global': vernier_band_global,
+    }
+    return region_main, region_vernier
+
+
+def _build_split_starvation_recovery_candidates(band_info: dict,
+                                                 split_y: int,
+                                                 full_h: int) -> list:
+    """Expose later measured band pairs for downstream starvation recovery."""
+    response = band_info.get('row_projection_smooth') if band_info else None
+    if response is None:
+        return []
+    values = np.asarray(response, dtype=float)
+    positive = values[values > 0]
+    if values.size < 16 or positive.size == 0:
+        return []
+
+    vmax = float(np.max(values))
+    min_len = max(7, min(30, int(full_h * 0.025)))
+    threshold = max(float(np.percentile(positive, 62)), vmax * 0.18)
+    segments = _contiguous_segments_1d(values >= threshold, min_len=min_len)
+    if len(segments) < 3:
+        segments = _contiguous_segments_1d(
+            values >= vmax * 0.12,
+            min_len=max(5, min_len // 2),
+        )
+    if len(segments) < 3:
+        return []
+
+    min_gap = max(3, int(full_h * 0.008))
+    max_gap = max(20, int(full_h * 0.22))
+    min_band_height = max(min_len, int(full_h * 0.04))
+    min_offset = max(20, int(full_h * 0.04))
+    candidates = []
+    for upper, lower in zip(segments, segments[1:]):
+        gap = int(lower[0] - upper[1])
+        candidate_split = int(round((upper[1] + lower[0]) / 2.0))
+        if gap < min_gap or gap > max_gap:
+            continue
+        if upper[0] <= split_y or candidate_split - split_y < min_offset:
+            continue
+        if candidate_split > full_h - int(full_h * config.region_split.min_vernier_height_ratio):
+            continue
+        if (upper[1] - upper[0] < min_band_height
+                or lower[1] - lower[0] < min_band_height):
+            continue
+
+        upper_mean = float(np.mean(values[upper[0]:upper[1]]))
+        lower_mean = float(np.mean(values[lower[0]:lower[1]]))
+        response_ratio = min(upper_mean, lower_mean) / max(
+            upper_mean, lower_mean, 1e-6
+        )
+        if response_ratio < 0.35:
+            continue
+        candidates.append({
+            'name': f'later_supported_band_pair_{len(candidates) + 1}',
+            'split_y': candidate_split,
+            'offset': candidate_split - int(split_y),
+            'main_tick_band': (int(upper[0]), int(upper[1])),
+            'vernier_tick_band': (int(lower[0]), int(lower[1])),
+            'evidence': {
+                'gap': gap,
+                'upper_mean': upper_mean,
+                'lower_mean': lower_mean,
+                'response_ratio': float(response_ratio),
+            },
+        })
+    return candidates
 
 
 def _foreground_binary(binary: np.ndarray, gray: np.ndarray = None) -> np.ndarray:

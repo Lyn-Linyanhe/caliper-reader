@@ -248,6 +248,45 @@ class ReadingRoiCandidateSelectionTests(unittest.TestCase):
         self.assertLess(guarded_x1, x1)
         self.assertGreater(guarded_x2, guarded_x1)
 
+    def test_13070_body_roi_recovery_candidate_restores_left_body_and_trims_tail(self):
+        image = cv2.imread(str(Path("tupian") / "130.70.jpg"))
+        self.assertIsNotNone(image)
+
+        result = roi_extract.locate_roi_lowres(image)
+        selection = result["roi_selection"]
+        selected = selection["candidate_boxes"]["body"]
+        full_body = selection.get("full_y_body")
+
+        self.assertEqual(selection["selected_stage"], "body")
+        self.assertIsNotNone(full_body)
+        body_range = full_body["body_range"]
+        self.assertLess(body_range[0], selected[2])
+        self.assertLess(selected[3], body_range[1] + 140)
+
+        candidates = result.get("roi_recovery_candidates", [])
+        self.assertTrue(candidates)
+        candidate = candidates[0]["box"]
+        self.assertLess(candidate[2], selected[2])
+        self.assertLess(candidate[3], selected[3])
+        self.assertLessEqual(candidate[2], body_range[0] + 20)
+        self.assertGreaterEqual(candidate[3], body_range[1])
+
+    def test_13070_short_vernier_run_triggers_body_roi_recovery(self):
+        image = cv2.imread(str(Path("tupian") / "130.70.jpg"))
+        self.assertIsNotNone(image)
+
+        pipeline = CaliperPipeline(fast_mode=True)
+        result = pipeline.run(image)
+
+        recovery = result.extra_info.get("roi_recovery")
+        self.assertIsNotNone(recovery)
+        self.assertTrue(recovery["triggered"])
+        self.assertGreaterEqual(len(recovery["attempts"]), 1)
+        self.assertEqual(recovery["selected_candidate"], None)
+        self.assertEqual(
+            pipeline.step_results["roi"].get("roi_recovery"), recovery
+        )
+
     def test_4020_rejects_compact_roi_and_reports_body_fallback(self):
         image = cv2.imread(str(Path("tupian") / "40.20.jpg"))
         self.assertIsNotNone(image)
