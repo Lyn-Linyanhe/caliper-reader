@@ -14,14 +14,18 @@ from pathlib import Path
 
 
 SVG_REL_ID = "rId101"
-SVG_TARGET = "media/图01_系统流程图_visio.svg"
+SVG_TARGET = "media/image13.svg"
 SVG_PACKAGE_PATH = "word/" + SVG_TARGET
-SVG_CONTENT_TYPE = '<Override PartName="/word/media/图01_系统流程图_visio.svg" ContentType="image/svg+xml" />'
-SVG_NAMESPACE = ' xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main"'
+SVG_CONTENT_TYPE = '<Default Extension="svg" ContentType="image/svg+xml" />'
 SVG_EXT = (
-    '<ns2:extLst><ns2:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">'
-    f'<asvg:svgBlip ns4:embed="{SVG_REL_ID}" />'
-    "</ns2:ext></ns2:extLst>"
+    '<ns2:extLst>'
+    '<ns2:ext uri="{28A0092B-C50C-407E-A947-70E740481C1C}">'
+    '<a14:useLocalDpi xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main" val="0" />'
+    "</ns2:ext>"
+    '<ns2:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">'
+    f'<asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" ns4:embed="{SVG_REL_ID}" />'
+    "</ns2:ext>"
+    "</ns2:extLst>"
 )
 
 
@@ -33,12 +37,6 @@ def replace_once(data: bytes, old: bytes, new: bytes, label: str) -> bytes:
 
 
 def patch_document_xml(data: bytes) -> bytes:
-    data = replace_once(
-        data,
-        b'<w:document ',
-        b'<w:document' + SVG_NAMESPACE.encode("utf-8") + b' ',
-        "document root",
-    )
     data = replace_once(
         data,
         b'<ns1:extent cx="3048000" cy="1524000" />',
@@ -60,7 +58,7 @@ def patch_document_xml(data: bytes) -> bytes:
     data = replace_once(
         data,
         b'<ns2:blip ns4:embed="rId40" />',
-        f'<ns2:blip ns4:embed="rId40">{SVG_EXT}</ns2:blip>'.encode("utf-8"),
+        f'<ns2:blip ns4:embed="rId40" cstate="print">{SVG_EXT}</ns2:blip>'.encode("utf-8"),
         "Figure 1 blip",
     )
     return data
@@ -76,7 +74,37 @@ def patch_relationships(data: bytes) -> bytes:
 
 
 def patch_content_types(data: bytes) -> bytes:
-    return replace_once(data, b"</Types>", SVG_CONTENT_TYPE.encode("utf-8") + b"</Types>", "content types")
+    additions = []
+    if b'Extension="png"' not in data:
+        additions.append('<Default Extension="png" ContentType="image/png" />')
+    if b'Extension="emf"' not in data:
+        additions.append('<Default Extension="emf" ContentType="image/x-emf" />')
+    if b'Extension="svg"' not in data:
+        additions.append(SVG_CONTENT_TYPE)
+    payload = "".join(additions).encode("utf-8") + b"</Types>"
+    return replace_once(data, b"</Types>", payload, "content types")
+
+
+def repair_docx_content_types(input_docx: Path, output_docx: Path) -> None:
+    """Repair image content-type declarations without changing document parts."""
+    input_docx = Path(input_docx)
+    output_docx = Path(output_docx)
+    if not input_docx.is_file():
+        raise FileNotFoundError(input_docx)
+    if input_docx.resolve() == output_docx.resolve():
+        raise ValueError("input_docx and output_docx must be different files")
+
+    output_docx.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(input_docx, "r") as source, zipfile.ZipFile(
+        output_docx, "w", compression=zipfile.ZIP_DEFLATED
+    ) as target:
+        if "[Content_Types].xml" not in source.namelist():
+            raise RuntimeError("DOCX package has no [Content_Types].xml")
+        for item in source.infolist():
+            payload = source.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                payload = patch_content_types(payload)
+            target.writestr(item, payload)
 
 
 def build(input_docx: Path, output_docx: Path, svg_path: Path, fallback_png: Path) -> None:
